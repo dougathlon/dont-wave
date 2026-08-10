@@ -1,7 +1,7 @@
 import { createRng, mixSeed, normalizeSeed } from "../simulation/rng";
 import type { CreatureDefinition, CreatureVisualDefinition } from "../simulation/types";
 
-export const DEFAULT_POPULATION_SIZE = 96;
+export const DEFAULT_POPULATION_SIZE = 48;
 
 const GIVEN_NAMES = [
   "Mallow",

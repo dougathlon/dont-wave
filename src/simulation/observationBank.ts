@@ -1,4 +1,4 @@
-import { createRng, hashText, mixSeed, normalizeSeed } from "./rng";
+import { hashText, mixSeed, normalizeSeed } from "./rng";
 import type {
   CreatureDefinition,
   TurnAddress,
@@ -9,16 +9,16 @@ import type {
 } from "./types";
 
 export const TOTAL_ROUNDS = 2;
-export const TURNS_PER_ROUND = 4;
-export const TURN_RECORD_SCHEMA_VERSION = 2 as const;
-export const TURN_RECORD_MODEL_ID = "dw-prepared-turn-v2" as const;
+export const TURNS_PER_ROUND = 2;
+export const TURN_RECORD_SCHEMA_VERSION = 3 as const;
+export const TURN_RECORD_MODEL_ID = "dw-prepared-turn-v3" as const;
+export const WAVERS_PER_RECORD = 10;
 
-const WAVE_PROBABILITY = 0.2;
 const ADDRESS_KEYS = ["round", "turn"] as const;
 const RECORD_KEYS = ["address", "bankId", "id", "outcomes", "provenance", "schemaVersion"] as const;
 const PROVENANCE_KEYS = ["bindingMethod", "integrity", "kind", "modelId", "preparedBeforePlay", "provider"] as const;
 
-/** Exactly eight immutable records, selected only by round and turn. */
+/** Exactly four immutable records, selected only by round and turn. */
 export class ClassicalDemoTurnBank implements TurnBank {
   readonly schemaVersion = TURN_RECORD_SCHEMA_VERSION;
   readonly modelId = TURN_RECORD_MODEL_ID;
@@ -83,7 +83,7 @@ export function validateTurnRecord(
   assertExactKeys(record.provenance as unknown as Record<string, unknown>, PROVENANCE_KEYS, "Turn record provenance");
 
   if (record.schemaVersion !== TURN_RECORD_SCHEMA_VERSION) {
-    throw new Error(`Turn record ${record.id || "<unnamed>"} does not use schema v2.`);
+    throw new Error(`Turn record ${record.id || "<unnamed>"} does not use schema v3.`);
   }
   if (record.bankId !== expectedBankId) {
     throw new Error(`Turn record ${record.id} belongs to bank ${record.bankId}, expected ${expectedBankId}.`);
@@ -136,11 +136,13 @@ function createRecord(
   creatures: readonly CreatureDefinition[],
   address: TurnAddress,
 ): TurnRecord {
+  const outcomeSeed = mixSeed(seed, TURN_RECORD_MODEL_ID, turnAddressKey(address));
+  const rankedIds = creatures
+    .map((creature) => creature.id)
+    .sort((left, right) => mixSeed(outcomeSeed, left) - mixSeed(outcomeSeed, right));
+  const wavingIds = new Set(rankedIds.slice(0, Math.min(WAVERS_PER_RECORD, rankedIds.length)));
   const outcomes: Record<string, TurnOutcome> = {};
-  for (const creature of creatures) {
-    const rng = createRng(mixSeed(seed, TURN_RECORD_MODEL_ID, turnAddressKey(address), creature.id));
-    outcomes[creature.id] = rng() < WAVE_PROBABILITY ? "waving" : "still";
-  }
+  for (const creature of creatures) outcomes[creature.id] = wavingIds.has(creature.id) ? "waving" : "still";
 
   const id = `${bankId}-${turnAddressKey(address)}`;
   const provenanceBase = {

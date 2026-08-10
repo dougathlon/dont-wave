@@ -11,8 +11,8 @@ export const WORLD = {
   rows: FIELD_ROWS,
 } as const;
 
-export const WATCH_CAMERA_POSITION = new Vector3(0, 10.8, 20.4);
-export const WATCH_CAMERA_TARGET = new Vector3(0, 1.25, -3.5);
+export const WATCH_CAMERA_POSITION = new Vector3(0, 12.6, 22.5);
+export const WATCH_CAMERA_TARGET = new Vector3(0, 1.05, -3.5);
 export const CROSSING_CAMERA_POSITION = new Vector3(0, 1.72, 13.2);
 export const CROSSING_CAMERA_TARGET = new Vector3(0, 1.48, -8.8);
 

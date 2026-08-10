@@ -40,9 +40,6 @@ export class Watchtower extends Group {
     const dark = this.material(PALETTE.ink.getHex(), 0.86, 0.08);
     const signal = this.material(PALETTE.coral.getHex(), 0.72, 0.18, 0.14);
 
-    const floor = this.mesh(new BoxGeometry(11.8, 0.35, 5.8), dark);
-    floor.position.set(0, 7.45, 18.6);
-    this.add(floor);
     for (const x of [-5.4, 5.4]) {
       const post = this.mesh(new BoxGeometry(0.32, 3.6, 0.32), frame);
       post.position.set(x, 9.25, 16.1);

@@ -4,7 +4,7 @@ export type DontWavePhase =
   | "green"
   | "reveal"
   | "hunt"
-  | "intermission"
+  | "report"
   | "descent"
   | "crossing-ready"
   | "crossing-green"
@@ -56,14 +56,14 @@ export interface TurnAddress {
 export interface TurnRecordProvenance {
   readonly kind: "classical-demo";
   readonly provider: string;
-  readonly modelId: "dw-prepared-turn-v2";
+  readonly modelId: "dw-prepared-turn-v3";
   readonly preparedBeforePlay: true;
   readonly bindingMethod: "stable-creature-id";
   readonly integrity: string;
 }
 
 export interface TurnRecord {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly id: string;
   readonly bankId: string;
   readonly address: TurnAddress;
@@ -88,6 +88,8 @@ export interface TurnSummary {
   readonly wavingIds: readonly string[];
   readonly stillIds: readonly string[];
   readonly safeIds: readonly string[];
+  readonly escapedThisTurn: number;
+  readonly unresolvedWavingIds: readonly string[];
   readonly zaps: readonly ZapEvent[];
 }
 
@@ -111,6 +113,7 @@ export interface DontWaveState {
   readonly greenElapsedMs: number;
   readonly phaseElapsedMs: number;
   readonly huntRemainingMs: number;
+  readonly sideOperatorStartsAtMs: number;
   readonly canTriggerRed: boolean;
   readonly creatures: readonly CreatureRuntimeState[];
   readonly currentRecord: TurnRecord | null;
@@ -132,8 +135,11 @@ export interface DontWaveState {
   readonly turnRightOperatorHits: number;
   readonly revealedWavers: number;
   readonly wavingRemaining: number;
+  readonly turnSafeAtStart: number;
+  readonly turnEscaped: number;
   readonly playerProgress: number;
   readonly playerMoving: boolean;
+  readonly playerStoppedAtRed: boolean;
   readonly statusMessage: string;
 }
 
@@ -148,8 +154,8 @@ export type ZapCreatureResult =
     };
 
 export interface TurnBank {
-  readonly schemaVersion: 2;
-  readonly modelId: "dw-prepared-turn-v2";
+  readonly schemaVersion: 3;
+  readonly modelId: "dw-prepared-turn-v3";
   readonly bankId: string;
   readonly seed: number;
   readonly creatureIds: readonly string[];

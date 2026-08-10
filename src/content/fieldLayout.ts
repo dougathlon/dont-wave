@@ -1,13 +1,13 @@
 import { hashText } from "../simulation/rng";
 
-export const FIELD_COLUMNS = 12;
-export const FIELD_ROWS = 8;
-export const FIELD_START_Z = 11.3;
+export const FIELD_COLUMNS = 8;
+export const FIELD_ROWS = 6;
+export const FIELD_START_Z = 7;
 export const FIELD_CHECKPOINT_Z = -13.8;
 export const FIELD_FINISH_Z = FIELD_CHECKPOINT_Z - 0.55;
-export const FIELD_ROW_STEP_Z = 2.18;
-export const FIELD_ROW_JITTER_Z = 0.32;
-export const CREATURE_CROSSING_MS = 80_000;
+export const FIELD_ROW_STEP_Z = 3.5;
+export const FIELD_ROW_JITTER_Z = 0.26;
+export const CREATURE_CROSSING_MS = 20_000;
 
 export function creatureStartingProgress(id: string, index: number): number {
   const row = Math.floor(index / FIELD_COLUMNS);

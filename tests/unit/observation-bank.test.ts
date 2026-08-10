@@ -5,28 +5,30 @@ import {
   TOTAL_ROUNDS,
   TURN_RECORD_MODEL_ID,
   TURNS_PER_ROUND,
+  WAVERS_PER_RECORD,
   turnAddressKey,
   validateTurnRecord,
 } from "../../src/simulation/observationBank";
 import type { TurnAddress, TurnRecord } from "../../src/simulation/types";
 
-describe("prepared turn bank v2", () => {
-  it("prepares exactly eight deterministic identity-bound records keyed only by round and turn", () => {
+describe("prepared turn bank v3", () => {
+  it("prepares exactly four deterministic identity-bound records keyed only by round and turn", () => {
     const creatures = createCreatureDefinitions(7_071);
     const first = new ClassicalDemoTurnBank(7_071, creatures);
     const second = new ClassicalDemoTurnBank(7_071, creatures);
 
     expect(first.recordCount()).toBe(TOTAL_ROUNDS * TURNS_PER_ROUND);
-    expect(first.recordCount()).toBe(8);
+    expect(first.recordCount()).toBe(4);
     for (let round = 1; round <= TOTAL_ROUNDS; round += 1) {
       for (let turn = 1; turn <= TURNS_PER_ROUND; turn += 1) {
         const address = { round, turn };
         const record = first.getRecord(address);
         expect(record).toEqual(second.getRecord(address));
         expect(Object.keys(record.address).sort()).toEqual(["round", "turn"]);
-        expect(Object.keys(record.outcomes)).toHaveLength(96);
+        expect(Object.keys(record.outcomes)).toHaveLength(48);
+        expect(Object.values(record.outcomes).filter((outcome) => outcome === "waving")).toHaveLength(WAVERS_PER_RECORD);
         expect(record).toMatchObject({
-          schemaVersion: 2,
+          schemaVersion: 3,
           address,
           provenance: {
             kind: "classical-demo",
@@ -104,14 +106,14 @@ describe("prepared turn bank v2", () => {
 
     expect(() => validateTurnRecord(record, bank.creatureIds, "WRONG-BANK")).toThrow("belongs to bank");
 
-    const v1Schema = { ...record, schemaVersion: 1 } as unknown as TurnRecord;
-    expect(() => validateTurnRecord(v1Schema, bank.creatureIds, bank.bankId)).toThrow("schema v2");
+    const legacySchema = { ...record, schemaVersion: 2 } as unknown as TurnRecord;
+    expect(() => validateTurnRecord(legacySchema, bank.creatureIds, bank.bankId)).toThrow("schema v3");
 
     const v1Model = {
       ...record,
       provenance: { ...record.provenance, modelId: "dw-demo-time-tuning-v1" },
     } as unknown as TurnRecord;
-    expect(() => validateTurnRecord(v1Model, bank.creatureIds, bank.bankId)).toThrow("dw-prepared-turn-v2");
+    expect(() => validateTurnRecord(v1Model, bank.creatureIds, bank.bankId)).toThrow("dw-prepared-turn-v3");
 
     const v1Address = { round: 1, turn: 1, timingBucket: 2, tuning: "coral" } as unknown as TurnAddress;
     expect(() => bank.getRecord(v1Address)).toThrow("exactly round, turn");

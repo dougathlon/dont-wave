@@ -15,7 +15,7 @@ interface DontWaveRuntime {
   advance(milliseconds: number): DontWaveState;
   zapCreature(creatureId: string): ZapCreatureResult;
   registerMiss(): DontWaveState;
-  continueRound(): DontWaveState;
+  continueFromReport(): DontWaveState;
   beginCrossing(): DontWaveState;
   setPlayerMoving(moving: boolean): DontWaveState;
   togglePause(): DontWaveState;
@@ -47,7 +47,7 @@ const test = base.extend<RuntimeFixtures>({
   ],
 });
 
-const SCREENSHOT_DIRECTORY = resolve(process.cwd(), "test-results/screenshots-v0.2");
+const SCREENSHOT_DIRECTORY = resolve(process.cwd(), "test-results/screenshots-v0.3");
 
 async function boot(page: Page): Promise<void> {
   await page.goto("?seed=7071", { waitUntil: "networkidle" });
@@ -164,13 +164,13 @@ async function driveToComplete(page: Page, touch = false): Promise<DontWaveState
         await activateControl(page, "red", touch);
         break;
       case "reveal":
-        await advance(page, 400);
+        await advance(page, 650);
         break;
       case "hunt":
-        await advance(page, 4_500);
+        await advance(page, 5_200);
         break;
-      case "intermission":
-        await activateControl(page, "continue-round", touch);
+      case "report":
+        await activateControl(page, "continue-report", touch);
         break;
       case "descent":
         await advance(page, 3_000);
@@ -182,7 +182,7 @@ async function driveToComplete(page: Page, touch = false): Promise<DontWaveState
         await useCrossingControl(page, touch);
         break;
       case "crossing-red":
-        await advance(page, 650);
+        await advance(page, 900);
         break;
       case "death":
         await advance(page, 1_200);
@@ -213,7 +213,7 @@ test.describe("desktop watchtower journey", () => {
     await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("READ THE FIELD");
     await capture(page, "desktop-red-reveal.png");
 
-    await advance(page, 400);
+    await advance(page, 650);
     await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("hunt");
     await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("YOUR WINDOW");
     await capture(page, "desktop-player-head-start.png");
@@ -246,18 +246,19 @@ test.describe("desktop watchtower journey", () => {
       return state.playerHits + state.playerMisses;
     })).toBe(shotsBeforeResumeSpace + 1);
     expect(await page.evaluate(() => window.__DONT_WAVE__.state().paused)).toBe(false);
-    await advance(page, 1_100);
+    await advance(page, 2_400);
+    await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("SIDE TOWERS ACTIVE");
     await capture(page, "desktop-side-operators-active.png");
 
     const complete = await driveToComplete(page);
     expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(8);
-    expect(new Set(complete.history.map((turn) => `${turn.address.round}:${turn.address.turn}`)).size).toBe(8);
+    expect(complete.history).toHaveLength(4);
+    expect(new Set(complete.history.map((turn) => `${turn.address.round}:${turn.address.turn}`)).size).toBe(4);
     expect(complete.playerProgress).toBeGreaterThan(0);
     expect(complete.counts.survivors).toBeGreaterThan(0);
     const sideScore = (complete.operatorHits * 100).toLocaleString("en-GB");
     await expect(page.locator("[data-ui='operator-score']")).toHaveText(sideScore);
-    await expect(page.locator(".dw-stat").filter({ hasText: "Side score" })).toContainText(sideScore);
+    await expect(page.locator(".dw-stat").filter({ hasText: "Tower score" })).toContainText(sideScore);
     await expect(page.getByRole("heading", { name: "THE TOWER CONTINUES." })).toBeVisible();
     await capture(page, "desktop-compulsory-ending.png");
     await page.getByTestId("restart").click();
@@ -295,7 +296,7 @@ test.describe("mobile landscape touch journey", () => {
     await page.getByTestId("green").tap();
     await advance(page, 700);
     await page.getByTestId("red").tap();
-    await advance(page, 400);
+    await advance(page, 650);
 
     await aimAndActivateVisibleWaver(page, "touch");
     await capture(page, "mobile-landscape-hunt.png");
@@ -324,7 +325,7 @@ test.describe("mobile landscape touch journey", () => {
 
     const complete = await driveToComplete(page, true);
     expect(complete).toMatchObject({ phase: "complete", playerMoving: false });
-    expect(complete.history).toHaveLength(8);
+    expect(complete.history).toHaveLength(4);
   });
 });
 
@@ -335,7 +336,7 @@ test.describe("presentation and provenance smoke", () => {
     await boot(page);
     const complete = await driveToComplete(page);
     expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(8);
+    expect(complete.history).toHaveLength(4);
   });
 
   test("the UI makes no quantum claim and the complete run makes no external request", async ({ page }, testInfo) => {
@@ -357,17 +358,17 @@ test.describe("presentation and provenance smoke", () => {
     await page.getByTestId("red").tap();
     const internal = await page.evaluate(() => window.__DONT_WAVE__.state().currentRecord);
     expect(internal).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       address: { round: 1, turn: 1 },
       provenance: {
         kind: "classical-demo",
-        modelId: "dw-prepared-turn-v2",
+        modelId: "dw-prepared-turn-v3",
         preparedBeforePlay: true,
       },
     });
     const complete = await driveToComplete(page, true);
     expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(8);
+    expect(complete.history).toHaveLength(4);
     const origin = new URL(page.url()).origin;
     expect(requests.every((url) => new URL(url).origin === origin)).toBe(true);
     await expect(page.locator(".dw-orientation-note")).toBeVisible();

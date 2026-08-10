@@ -243,6 +243,11 @@ button:focus-visible,
   color: var(--red);
 }
 
+.dw-score--escaped strong,
+.dw-stat--escaped strong {
+  color: var(--green);
+}
+
 .dw-pause-button {
   width: 42px;
   min-height: 42px;
@@ -351,6 +356,57 @@ button:focus-visible,
 
 .dw-shell.is-miss .dw-reticle {
   border-color: var(--red);
+}
+
+.dw-shot-feedback {
+  position: absolute;
+  z-index: 7;
+  top: calc(var(--reticle-y, 50%) - 34px);
+  left: var(--reticle-x, 50%);
+  min-width: 70px;
+  transform: translate(-50%, -50%);
+  color: var(--cyan);
+  font-family: Impact, "Arial Black", sans-serif;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-shadow: 0 2px 7px #000;
+  pointer-events: none;
+}
+
+.dw-shell.is-miss .dw-shot-feedback {
+  color: var(--red);
+}
+
+.dw-callout {
+  position: absolute;
+  z-index: 5;
+  top: max(86px, calc(env(safe-area-inset-top) + 72px));
+  left: 50%;
+  max-width: min(720px, calc(100vw - 40px));
+  margin: 0;
+  padding: 7px 12px;
+  transform: translateX(-50%);
+  border: 1px solid rgb(243 232 200 / 0.34);
+  border-radius: 2px;
+  background: rgb(7 24 23 / 0.78);
+  color: var(--cream);
+  font-size: clamp(0.65rem, 1vw, 0.8rem);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  line-height: 1.2;
+  text-align: center;
+  text-shadow: 0 2px 7px #000;
+  text-transform: uppercase;
+}
+
+.dw-callout:empty {
+  display: none;
+}
+
+.dw-shell[data-phase="reveal"] .dw-callout,
+.dw-shell[data-phase="hunt"] .dw-callout {
+  top: max(122px, calc(env(safe-area-inset-top) + 108px));
 }
 
 .dw-status {
@@ -522,6 +578,10 @@ button:focus-visible,
   background: var(--line);
 }
 
+.dw-loop {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .dw-loop span,
 .dw-summary-grid .dw-stat {
   min-height: 86px;
@@ -688,6 +748,18 @@ button:focus-visible,
     width: min(330px, calc(100vw - 30px));
   }
 
+  .dw-callout {
+    top: max(54px, calc(env(safe-area-inset-top) + 46px));
+    max-width: calc(100vw - 24px);
+    padding: 5px 8px;
+    font-size: 0.56rem;
+  }
+
+  .dw-shell[data-phase="reveal"] .dw-callout,
+  .dw-shell[data-phase="hunt"] .dw-callout {
+    top: max(91px, calc(env(safe-area-inset-top) + 82px));
+  }
+
   .dw-status {
     bottom: 76px;
     font-size: 0.61rem;
@@ -740,6 +812,10 @@ button:focus-visible,
     grid-template-columns: repeat(4, minmax(96px, 1fr));
     margin: 14px 0;
     overflow-x: auto;
+  }
+
+  .dw-loop {
+    grid-template-columns: repeat(3, minmax(96px, 1fr));
   }
 
   .dw-loop span,

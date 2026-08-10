@@ -1,6 +1,6 @@
 import type { DontWavePhase, DontWaveState } from "../simulation/types";
+import { HUNT_MS } from "../simulation/DontWaveSession";
 
-const HUNT_DURATION_MS = 4_500;
 const FOCUSABLE_SELECTOR = [
   "button:not([disabled])",
   "a[href]",
@@ -14,7 +14,7 @@ export interface DontWaveUIActions {
   start(): void;
   startGreen(): void;
   triggerRed(): void;
-  continueRound(): void;
+  continueFromReport(): void;
   beginCrossing(): void;
   setPlayerMoving(moving: boolean): void;
   togglePause(): void;
@@ -77,21 +77,23 @@ export class DontWaveUI {
     this.updateText("turn", `${state.turn} / ${state.turnsPerRound}`);
     this.updateText("player-score", state.playerScore.toLocaleString("en-GB"));
     this.updateText("operator-score", (state.operatorHits * 100).toLocaleString("en-GB"));
+    this.updateText("escaped", String(state.counts.safe));
     this.updateText("phase", phaseLabel(state.phase, state.paused));
+    this.updateText("callout", calloutText(state));
 
     const inResolution = state.phase === "reveal" || state.phase === "hunt";
     this.huntMeter.hidden = !inResolution;
     if (inResolution) {
       const progress = state.phase === "reveal"
         ? 100
-        : clamp((state.huntRemainingMs / HUNT_DURATION_MS) * 100, 0, 100);
+        : clamp((state.huntRemainingMs / HUNT_MS) * 100, 0, 100);
       this.huntMeter.style.setProperty("--hunt-progress", `${progress}%`);
       this.updateText("targets", String(state.wavingRemaining));
       this.updateText(
         "hunt-owner",
         state.phase === "reveal"
           ? "READ THE FIELD"
-          : state.phaseElapsedMs >= 1_100
+          : state.phaseElapsedMs >= state.sideOperatorStartsAtMs
             ? "SIDE TOWERS ACTIVE"
             : "YOUR WINDOW",
       );
@@ -115,8 +117,10 @@ export class DontWaveUI {
     window.clearTimeout(this.shotClassTimer);
     this.shell.classList.remove("is-hit", "is-miss");
     this.shell.classList.add(accepted ? "is-hit" : "is-miss");
+    this.updateText("shot-feedback", accepted ? "+100" : "MISS");
     this.shotClassTimer = window.setTimeout(() => {
       this.shell.classList.remove("is-hit", "is-miss");
+      this.updateText("shot-feedback", "");
     }, 180);
   }
 
@@ -223,8 +227,8 @@ export class DontWaveUI {
       case "red":
         this.actions.triggerRed();
         break;
-      case "continue-round":
-        this.actions.continueRound();
+      case "continue-report":
+        this.actions.continueFromReport();
         break;
       case "begin-crossing":
         this.actions.beginCrossing();
@@ -294,7 +298,8 @@ function shellMarkup(): string {
         <div class="dw-hud__right">
           <div class="dw-hud__scores" aria-label="Score">
             <span class="dw-score dw-score--player"><small>You</small><strong data-ui="player-score">0</strong></span>
-            <span class="dw-score dw-score--operators"><small>Side score</small><strong data-ui="operator-score">0</strong></span>
+            <span class="dw-score dw-score--operators"><small>Towers</small><strong data-ui="operator-score">0</strong></span>
+            <span class="dw-score dw-score--escaped"><small>Escaped</small><strong data-ui="escaped">0</strong></span>
           </div>
           <button class="dw-pause-button" type="button" data-action="pause" aria-label="Pause game">Ⅱ</button>
         </div>
@@ -306,6 +311,8 @@ function shellMarkup(): string {
       </div>
 
       <div class="dw-reticle" data-ui="reticle" aria-hidden="true" hidden></div>
+      <strong class="dw-shot-feedback" data-ui="shot-feedback" aria-hidden="true"></strong>
+      <p class="dw-callout" data-ui="callout" aria-live="polite"></p>
       <p class="dw-status" data-ui="status" aria-live="polite"></p>
 
       <div class="dw-controls">
@@ -326,12 +333,11 @@ function overlayMarkup(kind: string, state: DontWaveState): string {
       <div class="dw-panel" data-testid="briefing">
         <p class="dw-kicker">CIVIC PLAYGROUND 07 / TOWER CONTROL</p>
         <h1 class="dw-modal-focus" tabindex="-1"><span>DON'T</span><br>WAVE</h1>
-        <p class="dw-deck">You decide when the crowd stops. Anyone still is spared for now. Anyone waving is yours—until the side towers get there first.</p>
+        <p class="dw-deck">You control the crossing. The towers keep score.</p>
         <div class="dw-loop" aria-label="Game loop">
-          <span><b>01</b><strong>GREEN</strong><small>Release the crowd and let them cross.</small></span>
-          <span><b>02</b><strong>RED</strong><small>Choose the moment everyone must stop.</small></span>
-          <span><b>03</b><strong>ZAP</strong><small>Hit the ones visibly waving.</small></span>
-          <span><b>04</b><strong>DESCEND</strong><small>Leave the tower after round two.</small></span>
+          <span><b>01</b><strong>GREEN</strong><small>Let them run.</small></span>
+          <span><b>02</b><strong>RED</strong><small>Make them resolve.</small></span>
+          <span><b>03</b><strong>ZAP</strong><small>Click anyone waving before the towers do.</small></span>
         </div>
         <div class="dw-panel__actions">
           <button class="dw-primary" type="button" data-action="start" data-testid="start">TAKE THE TOWER →</button>
@@ -352,14 +358,16 @@ function overlayMarkup(kind: string, state: DontWaveState): string {
         </div>
       </div>`;
   }
-  if (kind === "intermission") {
+  if (kind === "report") {
+    const summary = state.history[state.history.length - 1];
+    const finalTurn = state.round === state.totalRounds && state.turn === state.turnsPerRound;
+    const roundComplete = state.turn === state.turnsPerRound;
     return `
-      <div class="dw-panel dw-panel--compact" data-testid="intermission">
-        <p class="dw-kicker">ROUND 01 / FIELD HELD</p>
-        <h2 class="dw-modal-focus" tabindex="-1">ONE ROUND REMAINS</h2>
-        <p class="dw-deck">The survivors keep their positions. The side towers keep their score.</p>
-        ${summaryMarkup(state)}
-        <div class="dw-panel__actions"><button class="dw-primary" type="button" data-action="continue-round" data-testid="continue-round">OPEN ROUND TWO →</button></div>
+      <div class="dw-panel dw-panel--compact" data-testid="report">
+        <p class="dw-kicker">ROUND ${pad(state.round)} / TURN ${pad(state.turn)} REPORT</p>
+        <h2 class="dw-modal-focus" tabindex="-1">${finalTurn ? "SHIFT COMPLETE" : roundComplete ? "ROUND COMPLETE" : "FIELD HELD"}</h2>
+        ${turnReportMarkup(state, summary)}
+        <div class="dw-panel__actions"><button class="dw-primary" type="button" data-action="continue-report" data-testid="continue-report">${finalTurn ? "LEAVE THE TOWER" : roundComplete ? "OPEN ROUND TWO" : "NEXT TURN"} →</button></div>
       </div>`;
   }
   if (kind === "crossing-ready") {
@@ -385,13 +393,24 @@ function summaryMarkup(state: DontWaveState): string {
     <div class="dw-summary-grid">
       <span class="dw-stat"><small>Your score</small><strong>${state.playerScore.toLocaleString("en-GB")}</strong></span>
       <span class="dw-stat"><small>Your hits</small><strong>${state.playerHits}</strong></span>
-      <span class="dw-stat"><small>Side score</small><strong>${(state.operatorHits * 100).toLocaleString("en-GB")}</strong></span>
-      <span class="dw-stat"><small>Survivors</small><strong>${state.counts.survivors}</strong></span>
+      <span class="dw-stat"><small>Tower score</small><strong>${(state.operatorHits * 100).toLocaleString("en-GB")}</strong></span>
+      <span class="dw-stat"><small>Escaped</small><strong>${state.counts.safe}</strong></span>
+    </div>`;
+}
+
+function turnReportMarkup(state: DontWaveState, summary: DontWaveState["history"][number] | undefined): string {
+  const towerHits = state.turnLeftOperatorHits + state.turnRightOperatorHits;
+  return `
+    <div class="dw-summary-grid dw-summary-grid--report">
+      <span class="dw-stat"><small>You hit</small><strong>${state.turnPlayerHits}</strong></span>
+      <span class="dw-stat"><small>Towers hit</small><strong>${towerHits}</strong></span>
+      <span class="dw-stat dw-stat--escaped"><small>Escaped this turn</small><strong>${summary?.escapedThisTurn ?? 0}</strong></span>
+      <span class="dw-stat"><small>Wavers left</small><strong>${summary?.unresolvedWavingIds.length ?? 0}</strong></span>
     </div>`;
 }
 
 function overlayPhase(phase: DontWavePhase): string {
-  if (phase === "briefing" || phase === "intermission" || phase === "crossing-ready" || phase === "complete") return phase;
+  if (phase === "briefing" || phase === "report" || phase === "crossing-ready" || phase === "complete") return phase;
   return "";
 }
 
@@ -404,13 +423,33 @@ function phaseLabel(phase: DontWavePhase, paused: boolean): string {
     case "reveal":
     case "crossing-red": return "RED";
     case "hunt": return "CLEAR";
-    case "intermission": return "ROUND HELD";
+    case "report": return "TURN REPORT";
     case "descent": return "DESCENDING";
     case "crossing-ready": return "FIELD ENTRY";
     case "crossing-green": return "GREEN";
     case "death": return "HIT";
     case "complete": return "CLOSED";
   }
+}
+
+function calloutText(state: DontWaveState): string {
+  if (state.paused) return "";
+  if (state.phase === "ready") return state.history.length === 0 ? "1 / RELEASE THE FIELD" : "GREEN / RELEASE THE FIELD";
+  if (state.phase === "green") {
+    return state.canTriggerRed
+      ? state.history.length === 0 ? "2 / CALL RED — WAITING LETS MORE ESCAPE" : "CALL RED — OR LET MORE ESCAPE"
+      : "WATCH THE GATE";
+  }
+  if (state.phase === "reveal") return "WATCH WHO MOVES";
+  if (state.phase === "hunt") return state.history.length === 0 ? "3 / CLICK THE WAVERS" : "CLICK THE WAVERS";
+  if (state.phase === "crossing-green") return "HOLD TO MOVE — RELEASE TO STOP";
+  if (state.phase === "crossing-red") return state.playerStoppedAtRed ? "YOU STOPPED" : "YOU WERE MOVING";
+  if (state.phase === "death") return "";
+  return "";
+}
+
+function pad(value: number): string {
+  return String(value).padStart(2, "0");
 }
 
 function isPausable(phase: DontWavePhase): boolean {

@@ -79,6 +79,7 @@ export class CreatureField extends Group {
   private readonly markingMeshes = new Map<number, InstancedMesh<SphereGeometry, MeshBasicMaterial>>();
   private readonly eyes: InstancedMesh<SphereGeometry, MeshBasicMaterial>;
   private readonly pupils: InstancedMesh<SphereGeometry, MeshBasicMaterial>;
+  private readonly waveRings: InstancedMesh<TorusGeometry, MeshBasicMaterial>;
   private readonly focusRing: Mesh<TorusGeometry, MeshBasicMaterial>;
   private readonly deathStartedAt = new Map<string, number>();
   private readonly previousZappedBy = new Map<string, string | null>();
@@ -182,12 +183,27 @@ export class CreatureField extends Group {
       toneMapped: false,
     });
     this.ownedMaterials.add(pickMaterial);
-    const pickGeometry = new BoxGeometry(1.45, 2.5, 1.25);
+    const pickGeometry = new BoxGeometry(1.6, 3.15, 1.35);
     this.ownedGeometries.add(pickGeometry);
     this.pickTargets = new InstancedMesh(pickGeometry, pickMaterial, creatures.length);
     this.pickTargets.name = "creature-pick-targets";
     this.pickTargets.frustumCulled = false;
     this.add(this.pickTargets);
+
+    const waveRingMaterial = new MeshBasicMaterial({
+      color: PALETTE.coral,
+      transparent: true,
+      opacity: 0.72,
+      depthWrite: false,
+      toneMapped: false,
+      fog: false,
+    });
+    this.ownedMaterials.add(waveRingMaterial);
+    const waveRingGeometry = new TorusGeometry(0.86, 0.045, 5, 28);
+    this.ownedGeometries.add(waveRingGeometry);
+    this.waveRings = this.instanced(waveRingGeometry, waveRingMaterial, creatures.length);
+    this.waveRings.renderOrder = 14;
+    this.add(this.waveRings);
 
     const focusMaterial = new MeshBasicMaterial({
       color: PALETTE.cream,
@@ -285,7 +301,9 @@ export class CreatureField extends Group {
     const height = slot.traits.heightScale;
     const lean = slot.traits.lean * Math.PI / 180;
     const bodyCenter = base.clone().add(new Vector3(0, 1.05 + bob, 0));
-    const bodyScale = bodyScaleFor(slot.bodyShape, width, height).multiplyScalar(Math.max(0.0001, deathScale));
+    const poseScale = waving ? 1.06 : String(creature.pose) === "still" ? 0.92 : 1;
+    const bodyScale = bodyScaleFor(slot.bodyShape, width, height)
+      .multiplyScalar(Math.max(0.0001, deathScale * poseScale));
     const bodyMesh = requiredMesh(this.bodyMeshes, slot.bodyKey);
     const armMesh = requiredMesh(this.armMeshes, slot.traits.bodyColor);
     const feetMesh = requiredMesh(this.feetMeshes, slot.traits.accentColor);
@@ -351,12 +369,26 @@ export class CreatureField extends Group {
     this.setTransform(
       this.pickTargets,
       slot.index,
-      new Vector3(base.x, base.y + 1.15, base.z),
+      new Vector3(base.x, base.y + 1.42, base.z),
       0,
       0,
       0,
       deathScale <= 0 ? HIDDEN_SCALE : new Vector3(1, 1, 1),
     );
+    if (waving && deathScale > 0) {
+      const pulse = reducedMotion ? 1 : 1 + Math.sin(elapsedMs * 0.012 + slot.phase) * 0.08;
+      this.setTransform(
+        this.waveRings,
+        slot.index,
+        new Vector3(base.x, base.y + 1.24, base.z + 0.12),
+        0,
+        0,
+        0,
+        new Vector3(pulse, pulse * 1.18, pulse),
+      );
+    } else {
+      this.hideInstance(this.waveRings, slot.index);
+    }
   }
 
   private placeArm(
@@ -373,7 +405,7 @@ export class CreatureField extends Group {
   ): void {
     this.start.set(base.x + shoulderX, shoulderY, base.z);
     if (raised) {
-      this.end.set(base.x + shoulderX + side * (0.23 + wave * 0.16), shoulderY + 1.14, base.z + 0.02);
+      this.end.set(base.x + shoulderX + side * (0.48 + wave * 0.25), shoulderY + 1.52, base.z + 0.05);
     } else {
       this.end.set(base.x + shoulderX + side * (0.22 + gait * 0.06), shoulderY - 0.75, base.z + gait * side * 0.12);
     }
@@ -425,6 +457,7 @@ export class CreatureField extends Group {
     }
     this.hideInstance(markingMesh, slot.accentInstance);
     this.hideInstance(this.pickTargets, slot.index);
+    this.hideInstance(this.waveRings, slot.index);
   }
 
   private hideInstance(mesh: InstancedMesh, index: number): void {
@@ -488,6 +521,7 @@ export class CreatureField extends Group {
       this.pupils,
       ...this.earMeshes.values(),
       ...this.markingMeshes.values(),
+      this.waveRings,
       this.pickTargets,
     ]) mesh.instanceMatrix.needsUpdate = true;
   }

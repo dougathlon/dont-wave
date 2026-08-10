@@ -1,4 +1,5 @@
 import "./styles.css";
+import { AudioDirector } from "./audio/AudioDirector";
 import {
   DontWaveWorld,
   RENDER_STATUS_EVENT,
@@ -19,7 +20,7 @@ interface DontWaveRuntime {
   advance(milliseconds: number): DontWaveState;
   zapCreature(creatureId: string): ZapCreatureResult;
   registerMiss(): DontWaveState;
-  continueRound(): DontWaveState;
+  continueFromReport(): DontWaveState;
   beginCrossing(): DontWaveState;
   setPlayerMoving(moving: boolean): DontWaveState;
   togglePause(): DontWaveState;
@@ -39,25 +40,25 @@ if (!gameRoot || !uiRoot) throw new Error("Don't Wave could not find its applica
 
 const session = new DontWaveSession(readSeed());
 const world = new DontWaveWorld(gameRoot, session);
+const audio = new AudioDirector();
 const ui = new DontWaveUI(uiRoot, {
-  start: () => { session.start(); },
+  start: () => { audio.unlock(); session.start(); },
   startGreen: () => { session.startGreen(); },
   triggerRed: () => { session.triggerRed(); },
-  continueRound: () => { session.continueRound(); },
+  continueFromReport: () => { session.continueFromReport(); },
   beginCrossing: () => { session.beginCrossing(); },
   setPlayerMoving: (moving) => { session.setPlayerMoving(moving); },
   togglePause: () => { session.togglePause(); },
   restart: () => { session.restart(); },
 });
 const input = new InputController(session, () => world.fireAtReticle());
-let previousPlayerHits = session.getState().playerHits;
-let previousPlayerMisses = session.getState().playerMisses;
+let previousState = session.getState();
 const unsubscribeUI = session.subscribe((state) => {
   ui.render(state);
-  if (state.playerHits > previousPlayerHits) ui.flashShot(true);
-  else if (state.playerMisses > previousPlayerMisses) ui.flashShot(false);
-  previousPlayerHits = state.playerHits;
-  previousPlayerMisses = state.playerMisses;
+  if (state.playerHits > previousState.playerHits) ui.flashShot(true);
+  else if (state.playerMisses > previousState.playerMisses) ui.flashShot(false);
+  audio.sync(previousState, state);
+  previousState = state;
 });
 
 const onReticle = (event: Event): void => {
@@ -94,7 +95,7 @@ window.__DONT_WAVE__ = {
   },
   zapCreature: (creatureId) => session.zapCreature(creatureId),
   registerMiss: () => mutateAndSnapshot(() => { session.registerMiss(); }),
-  continueRound: () => mutateAndSnapshot(() => { session.continueRound(); }),
+  continueFromReport: () => mutateAndSnapshot(() => { session.continueFromReport(); }),
   beginCrossing: () => mutateAndSnapshot(() => { session.beginCrossing(); }),
   setPlayerMoving: (moving) => mutateAndSnapshot(() => { session.setPlayerMoving(moving); }),
   togglePause: () => mutateAndSnapshot(() => { session.togglePause(); }),
@@ -108,6 +109,7 @@ window.addEventListener("beforeunload", () => {
   unsubscribeUI();
   input.destroy();
   ui.destroy();
+  audio.destroy();
   world.destroy();
 }, { once: true });
 

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createCreatureDefinitions, DEFAULT_POPULATION_SIZE } from "../../src/content/creatures";
 
 describe("creature content", () => {
-  it("creates 96 stable, unique identities with cosmetic variation only", () => {
+  it("creates 48 stable, unique identities with cosmetic variation only", () => {
     const first = createCreatureDefinitions(7_071);
     const second = createCreatureDefinitions(7_071);
 

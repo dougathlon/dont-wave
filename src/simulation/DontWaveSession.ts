@@ -26,16 +26,22 @@ import type {
 } from "./types";
 
 export const MIN_RED_TRIGGER_MS = 700;
-export const MAX_GREEN_MS = 4_500;
-export const REVEAL_MS = 400;
-export const HUNT_MS = 4_500;
-export const SIDE_OPERATOR_START_MS = 1_100;
-export const SIDE_OPERATOR_INTERVAL_MS = 450;
+export const MAX_GREEN_MS = 5_500;
+export const REVEAL_MS = 650;
+export const HUNT_MS = 5_200;
+export const SIDE_OPERATOR_INTERVAL_MS = 700;
 export const DESCENT_MS = 3_000;
 export const CROSSING_GREEN_MS = 4_500;
-export const CROSSING_RED_MS = 650;
+export const CROSSING_RED_MS = 900;
 export const DEATH_MS = 1_200;
 export const CORRECT_HIT_SCORE = 100;
+
+const SIDE_OPERATOR_STARTS_MS = [2_400, 1_800, 1_500, 1_200] as const;
+
+export function sideOperatorStartMs(round: number, turn: number): number {
+  const index = (round - 1) * TURNS_PER_ROUND + (turn - 1);
+  return SIDE_OPERATOR_STARTS_MS[index] ?? 1_200;
+}
 
 const CREATURE_PROGRESS_PER_MS = 1 / CREATURE_CROSSING_MS;
 const PLAYER_PROGRESS_PER_MS = 1 / 6_000;
@@ -107,8 +113,11 @@ export class DontWaveSession {
       turnRightOperatorHits: 0,
       revealedWavers: 0,
       wavingRemaining: 0,
+      turnSafeAtStart: this.state.counts.safe,
       creatures: setActivePose(this.state.creatures, "moving"),
-      statusMessage: `Round ${this.state.round}, turn ${this.state.turn}: GREEN.`,
+      statusMessage: this.state.history.length === 0
+        ? "GREEN. Watch the gate, then choose when to call RED."
+        : "GREEN. Waiting lets more people escape.",
     });
     this.emit();
     return true;
@@ -147,14 +156,27 @@ export class DontWaveSession {
     return true;
   }
 
-  continueRound(): boolean {
-    if (this.state.phase !== "intermission" || this.state.paused) return false;
-    if (this.state.round !== 1 || this.state.turn !== TURNS_PER_ROUND) return false;
+  continueFromReport(): boolean {
+    if (this.state.phase !== "report" || this.state.paused) return false;
+    const runComplete = this.state.round === TOTAL_ROUNDS && this.state.turn === TURNS_PER_ROUND;
+    if (runComplete) {
+      this.state = derive({
+        ...this.state,
+        phase: "descent",
+        phaseElapsedMs: 0,
+        playerMoving: false,
+        statusMessage: "Your station is descending to the field.",
+      });
+      this.emit();
+      return true;
+    }
+    const nextRound = this.state.turn === TURNS_PER_ROUND ? this.state.round + 1 : this.state.round;
+    const nextTurn = this.state.turn === TURNS_PER_ROUND ? 1 : this.state.turn + 1;
     this.state = derive({
       ...this.state,
       phase: "ready",
-      round: 2,
-      turn: 1,
+      round: nextRound,
+      turn: nextTurn,
       greenElapsedMs: 0,
       phaseElapsedMs: 0,
       currentRecord: null,
@@ -168,8 +190,9 @@ export class DontWaveSession {
       turnRightOperatorHits: 0,
       revealedWavers: 0,
       wavingRemaining: 0,
+      turnSafeAtStart: this.state.counts.safe,
       creatures: setActivePose(this.state.creatures, "idle"),
-      statusMessage: "Round 2, turn 1 ready. Progress retained.",
+      statusMessage: `Round ${nextRound}, turn ${nextTurn}. Release the field when ready.`,
     });
     this.emit();
     return true;
@@ -183,6 +206,7 @@ export class DontWaveSession {
       phaseElapsedMs: 0,
       playerProgress: 0,
       playerMoving: false,
+      playerStoppedAtRed: false,
       statusMessage: "GREEN. Hold movement to cross.",
     });
     this.emit();
@@ -338,7 +362,9 @@ export class DontWaveSession {
       ...this.state,
       phase: "hunt",
       phaseElapsedMs: 0,
-      statusMessage: "Hunt open. Zap only waving creatures.",
+      statusMessage: this.state.history.length === 0
+        ? "CLICK THE WAVERS. The side towers will join shortly."
+        : "Hunt open. Claim the wavers before the towers do.",
     });
     this.emit();
   }
@@ -349,7 +375,7 @@ export class DontWaveSession {
 
     while (this.state.wavingRemaining > 0) {
       const sideHitsThisTurn = this.state.turnLeftOperatorHits + this.state.turnRightOperatorHits;
-      const nextZapAt = SIDE_OPERATOR_START_MS + sideHitsThisTurn * SIDE_OPERATOR_INTERVAL_MS;
+      const nextZapAt = this.state.sideOperatorStartsAtMs + sideHitsThisTurn * SIDE_OPERATOR_INTERVAL_MS;
       if (nextZapAt > nextElapsed || nextZapAt > HUNT_MS) break;
       const operator: SideOperatorId = sideHitsThisTurn % 2 === 0 ? "left" : "right";
       const target = this.nextSideOperatorTarget(operator);
@@ -357,12 +383,16 @@ export class DontWaveSession {
       this.claimCreature(target.id, operator, nextZapAt);
     }
 
+    if (this.state.wavingRemaining === 0) {
+      this.finishHunt();
+      return;
+    }
+
     if (nextElapsed < HUNT_MS) {
       this.emit();
       return;
     }
 
-    this.clearRemainingAtTimeout();
     this.finishHunt();
   }
 
@@ -376,16 +406,6 @@ export class DontWaveSession {
       mixSeed(this.seed, recordId, operator, left.id) - mixSeed(this.seed, recordId, operator, right.id)
     ));
     return candidates[0] ?? null;
-  }
-
-  private clearRemainingAtTimeout(): void {
-    while (this.state.wavingRemaining > 0) {
-      const sideHitsThisTurn = this.state.turnLeftOperatorHits + this.state.turnRightOperatorHits;
-      const operator: SideOperatorId = sideHitsThisTurn % 2 === 0 ? "left" : "right";
-      const target = this.nextSideOperatorTarget(operator);
-      if (!target) throw new Error("Waving count disagrees with eligible prepared outcomes.");
-      this.claimCreature(target.id, operator, HUNT_MS);
-    }
   }
 
   private claimCreature(
@@ -430,7 +450,13 @@ export class DontWaveSession {
   private finishHunt(): void {
     const record = this.state.currentRecord;
     if (!record) throw new Error("Cannot finish a hunt without its prepared record.");
-    if (this.state.wavingRemaining !== 0) throw new Error("Cannot finish a hunt with unresolved waving creatures.");
+    const unresolvedWavingIds = this.state.creatures
+      .filter((creature) => creature.status === "active" && creature.pose === "waving" && !creature.zappedBy)
+      .map((creature) => creature.id);
+    if (unresolvedWavingIds.length !== this.state.wavingRemaining) {
+      throw new Error("Waving count disagrees with unresolved prepared outcomes.");
+    }
+    const escapedThisTurn = this.state.counts.safe - this.state.turnSafeAtStart;
     const summary: TurnSummary = Object.freeze({
       recordId: record.id,
       bankId: record.bankId,
@@ -441,52 +467,20 @@ export class DontWaveSession {
       wavingIds: Object.freeze([...this.state.revealedWavingIds]),
       stillIds: Object.freeze([...this.state.revealedStillIds]),
       safeIds: Object.freeze([...this.state.revealedSafeIds]),
+      escapedThisTurn,
+      unresolvedWavingIds: Object.freeze(unresolvedWavingIds),
       zaps: Object.freeze([...this.state.turnZaps]),
     });
     const history = [...this.state.history, summary];
-    if (this.state.round === TOTAL_ROUNDS && this.state.turn === TURNS_PER_ROUND) {
-      this.state = derive({
-        ...this.state,
-        phase: "descent",
-        phaseElapsedMs: 0,
-        history,
-        creatures: setActivePose(this.state.creatures, "idle"),
-        playerMoving: false,
-        statusMessage: "Your station is descending to the field.",
-      });
-    } else if (this.state.turn === TURNS_PER_ROUND) {
-      this.state = derive({
-        ...this.state,
-        phase: "intermission",
-        phaseElapsedMs: 0,
-        history,
-        creatures: setActivePose(this.state.creatures, "idle"),
-        statusMessage: `Round ${this.state.round} complete.`,
-      });
-    } else {
-      const nextTurn = this.state.turn + 1;
-      this.state = derive({
-        ...this.state,
-        phase: "ready",
-        turn: nextTurn,
-        greenElapsedMs: 0,
-        phaseElapsedMs: 0,
-        currentRecord: null,
-        revealedWavingIds: [],
-        revealedStillIds: [],
-        revealedSafeIds: [],
-        turnZaps: [],
-        forcedRed: false,
-        turnPlayerHits: 0,
-        turnLeftOperatorHits: 0,
-        turnRightOperatorHits: 0,
-        revealedWavers: 0,
-        wavingRemaining: 0,
-        history,
-        creatures: setActivePose(this.state.creatures, "idle"),
-        statusMessage: `Round ${this.state.round}, turn ${nextTurn} ready. Progress retained.`,
-      });
-    }
+    this.state = derive({
+      ...this.state,
+      phase: "report",
+      phaseElapsedMs: 0,
+      history,
+      creatures: setActivePose(this.state.creatures, "idle"),
+      playerMoving: false,
+      statusMessage: `Turn complete. ${escapedThisTurn} escaped; ${unresolvedWavingIds.length} wavers remain in the field.`,
+    });
     this.emit();
   }
 
@@ -523,8 +517,11 @@ export class DontWaveSession {
       phase: "crossing-red",
       phaseElapsedMs: 0,
       playerProgress,
+      playerStoppedAtRed: !this.state.playerMoving,
       playerMoving: false,
-      statusMessage: "RED. Your arm rises anyway.",
+      statusMessage: this.state.playerMoving
+        ? "RED. You were moving. Your arm rises."
+        : "RED. You stopped. Your arm rises anyway.",
     });
     this.emit();
   }
@@ -590,6 +587,7 @@ function createInitialState(
     greenElapsedMs: 0,
     phaseElapsedMs: 0,
     huntRemainingMs: 0,
+    sideOperatorStartsAtMs: sideOperatorStartMs(1, 1),
     canTriggerRed: false,
     creatures,
     currentRecord: null,
@@ -611,8 +609,11 @@ function createInitialState(
     turnRightOperatorHits: 0,
     revealedWavers: 0,
     wavingRemaining: 0,
+    turnSafeAtStart: 0,
+    turnEscaped: 0,
     playerProgress: 0,
     playerMoving: false,
+    playerStoppedAtRed: false,
     statusMessage: "Awaiting briefing acknowledgement.",
   });
 }
@@ -624,6 +625,7 @@ function derive(state: DontWaveState): DontWaveState {
       ? Math.max(0, HUNT_MS - state.phaseElapsedMs)
       : 0;
   const operatorHits = state.leftOperatorHits + state.rightOperatorHits;
+  const counts = countPopulation(state.creatures);
   const canTriggerRed = state.phase === "green"
     && !state.paused
     && state.greenElapsedMs >= MIN_RED_TRIGGER_MS;
@@ -632,7 +634,9 @@ function derive(state: DontWaveState): DontWaveState {
     huntRemainingMs,
     canTriggerRed,
     operatorHits,
-    counts: countPopulation(state.creatures),
+    sideOperatorStartsAtMs: sideOperatorStartMs(state.round, state.turn),
+    turnEscaped: Math.max(0, counts.safe - state.turnSafeAtStart),
+    counts,
   };
   if (next.currentRecord) {
     const accounted = next.turnPlayerHits
@@ -679,7 +683,7 @@ function validateBankIdentity(
   definitions: readonly CreatureDefinition[],
 ): void {
   if (bank.schemaVersion !== TURN_RECORD_SCHEMA_VERSION || bank.modelId !== TURN_RECORD_MODEL_ID) {
-    throw new Error(`Turn bank must use schema v2 and model ${TURN_RECORD_MODEL_ID}.`);
+    throw new Error(`Turn bank must use schema v3 and model ${TURN_RECORD_MODEL_ID}.`);
   }
   if (bank.seed !== seed) throw new Error(`Turn bank seed ${bank.seed} does not match run seed ${seed}.`);
   const expected = definitions.map((definition) => definition.id).sort();
