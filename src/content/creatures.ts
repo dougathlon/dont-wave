@@ -1,75 +1,45 @@
-import { createRng, mixSeed, normalizeSeed } from "../simulation/rng";
-import type { CreatureDefinition, CreatureVisualDefinition } from "../simulation/types";
+import { CONTESTANT_COUNT, fieldSlot } from "./fieldLayout";
+import { mixSeed, normalizeSeed } from "../simulation/rng";
+import type { ContestantDefinition, ContestantVisual } from "../simulation/types";
 
-export const DEFAULT_POPULATION_SIZE = 48;
+const SKINS = [0xd5a176, 0xb9785d, 0x8e594d, 0xe0b28b, 0x735044, 0xc58d6d] as const;
+const SUITS = [0x315d56, 0x4f6b61, 0x355d68, 0x5b554d, 0x406058, 0x574d64] as const;
+const ACCENTS = [0xe55f4d, 0xe9bf55, 0x7dc9ba, 0xd98aaa, 0x9bbd66, 0xd89b5d] as const;
 
-const GIVEN_NAMES = [
-  "Mallow",
-  "Brindle",
-  "Oona",
-  "Tippet",
-  "Luma",
-  "Fen",
-  "Poggle",
-  "Nib",
-  "Sable",
-  "Tansy",
-  "Orlo",
-  "Vesper",
-] as const;
-
-const FAMILY_NAMES = ["Bell", "Moss", "Glint", "Thimble", "Rook", "Purl", "Soot", "Wren"] as const;
-const BODY_SHAPES = ["bean", "gourd", "orb", "slug"] as const;
-const EAR_STYLES = ["antennae", "droop", "fan", "horns"] as const;
-const MARKINGS = ["belly", "freckles", "stripe", "patch"] as const;
-const BODY_COLORS = [0xf0d49a, 0xdb8e83, 0x8cc8bd, 0xa9bd68, 0x9f7ca7, 0xd1a76d, 0xc987b0, 0x91a4c4] as const;
-const ACCENT_COLORS = [0xff786f, 0x65ded1, 0xb6cf5b, 0xe4b4d0, 0xf0cc68, 0x7d6d9e] as const;
-
-/**
- * Creates stable identities with seeded cosmetic variation. Every returned creature
- * has the same simulation speed, outcome probability, hitbox, and eligibility.
- */
-export function createCreatureDefinitions(seed: number, count = DEFAULT_POPULATION_SIZE): readonly CreatureDefinition[] {
-  if (!Number.isInteger(count) || count <= 0 || count > DEFAULT_POPULATION_SIZE) {
-    throw new Error(`Creature count must be an integer from 1 to ${DEFAULT_POPULATION_SIZE}.`);
-  }
-
-  const normalizedSeed = normalizeSeed(seed);
-  return Array.from({ length: count }, (_, index) => {
-    const id = `DW-${String(index + 1).padStart(3, "0")}`;
-    const given = pick(GIVEN_NAMES, index % GIVEN_NAMES.length);
-    const family = pick(FAMILY_NAMES, Math.floor(index / GIVEN_NAMES.length));
-    const visualRng = createRng(mixSeed(normalizedSeed, id, "visual-v2"));
-    return {
+export function createContestantDefinitions(seed: number, round: number): readonly ContestantDefinition[] {
+  const normalized = normalizeSeed(seed);
+  return Object.freeze(Array.from({ length: CONTESTANT_COUNT }, (_, slot) => {
+    const id = `contestant-${String(slot + 1).padStart(2, "0")}`;
+    const layout = fieldSlot(slot);
+    const visualSeed = mixSeed(normalized, "contestant", round, id);
+    const visual: ContestantVisual = Object.freeze({
+      skinColor: choose(SKINS, visualSeed),
+      suitColor: choose(SUITS, visualSeed >>> 3),
+      accentColor: choose(ACCENTS, visualSeed >>> 7),
+      headScale: 0.82 + unit(visualSeed, 11) * 0.38,
+      torsoWidth: 0.78 + unit(visualSeed, 17) * 0.44,
+      torsoHeight: 0.86 + unit(visualSeed, 23) * 0.34,
+      eyeCount: ((visualSeed >>> 13) % 3 + 1) as 1 | 2 | 3,
+      armLength: 0.86 + unit(visualSeed, 29) * 0.26,
+      waveHand: (visualSeed & 1) === 0 ? "left" : "right",
+      gaitPhase: unit(visualSeed, 37) * Math.PI * 2,
+    });
+    return Object.freeze({
       id,
-      name: `${given} ${family}`,
-      visual: createVisual(visualRng, index),
-    };
-  });
+      slot,
+      x: layout.x + (unit(visualSeed, 41) - 0.5) * 0.32,
+      startZ: layout.startZ,
+      visual,
+    });
+  }));
 }
 
-function createVisual(rng: () => number, index: number): CreatureVisualDefinition {
-  return {
-    bodyShape: pick(BODY_SHAPES, Math.floor(rng() * BODY_SHAPES.length)),
-    bodyColor: pick(BODY_COLORS, Math.floor(rng() * BODY_COLORS.length)),
-    accentColor: pick(ACCENT_COLORS, (index + Math.floor(rng() * ACCENT_COLORS.length)) % ACCENT_COLORS.length),
-    eyeCount: pick([1, 2, 3] as const, Math.floor(rng() * 3)),
-    eyeScale: round(0.76 + rng() * 0.42),
-    earStyle: pick(EAR_STYLES, Math.floor(rng() * EAR_STYLES.length)),
-    marking: pick(MARKINGS, Math.floor(rng() * MARKINGS.length)),
-    widthScale: round(0.78 + rng() * 0.38),
-    heightScale: round(0.78 + rng() * 0.4),
-    lean: Math.round(rng() * 10 - 5),
-    leftHanded: rng() < 0.5,
-  };
-}
-
-function round(value: number): number {
-  return Math.round(value * 1_000) / 1_000;
-}
-
-function pick<T>(values: readonly T[], index: number): T {
-  const value = values[((index % values.length) + values.length) % values.length];
-  if (value === undefined) throw new Error("Cannot select from an empty content list.");
+function choose<T>(values: readonly T[], seed: number): T {
+  const value = values[Math.abs(seed) % values.length];
+  if (value === undefined) throw new Error("Visual palette is empty.");
   return value;
+}
+
+function unit(seed: number, salt: number): number {
+  return (mixSeed(seed, salt) >>> 0) / 0xffffffff;
 }

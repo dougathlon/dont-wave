@@ -4,7 +4,10 @@ export type DontWavePhase =
   | "green"
   | "reveal"
   | "hunt"
-  | "report"
+  | "rivals"
+  | "interturn"
+  | "round-break"
+  | "final-standings"
   | "descent"
   | "crossing-ready"
   | "crossing-green"
@@ -13,40 +16,39 @@ export type DontWavePhase =
   | "complete";
 
 export type OperatorId = "player" | "left" | "right";
-export type SideOperatorId = Exclude<OperatorId, "player">;
+export type RivalId = Exclude<OperatorId, "player">;
+export type ContestantStatus = "active" | "evaporated" | "crossed";
+export type ContestantPose = "idle" | "walking" | "still" | "waving";
 
-export type CreatureStatus = "active" | "safe" | "removed";
-export type CreaturePose = "idle" | "moving" | "still" | "waving" | "zapped" | "safe";
-
-/** Cosmetic data only. No visual field changes movement, outcomes, hitboxes, or eligibility. */
-export interface CreatureVisualDefinition {
-  readonly bodyShape: "bean" | "gourd" | "orb" | "slug";
-  readonly bodyColor: number;
+/** Visual variation never changes speed, outcome eligibility, score, or hitbox size. */
+export interface ContestantVisual {
+  readonly skinColor: number;
+  readonly suitColor: number;
   readonly accentColor: number;
+  readonly headScale: number;
+  readonly torsoWidth: number;
+  readonly torsoHeight: number;
   readonly eyeCount: 1 | 2 | 3;
-  readonly eyeScale: number;
-  readonly earStyle: "antennae" | "droop" | "fan" | "horns";
-  readonly marking: "belly" | "freckles" | "stripe" | "patch";
-  readonly widthScale: number;
-  readonly heightScale: number;
-  readonly lean: number;
-  readonly leftHanded: boolean;
+  readonly armLength: number;
+  readonly waveHand: "left" | "right";
+  readonly gaitPhase: number;
 }
 
-export interface CreatureDefinition {
+export interface ContestantDefinition {
   readonly id: string;
-  readonly name: string;
-  readonly visual: CreatureVisualDefinition;
+  readonly slot: number;
+  readonly x: number;
+  readonly startZ: number;
+  readonly visual: ContestantVisual;
 }
 
-export interface CreatureRuntimeState extends CreatureDefinition {
-  readonly status: CreatureStatus;
-  readonly pose: CreaturePose;
-  readonly progress: number;
-  readonly zappedBy?: OperatorId;
+export interface ContestantState extends ContestantDefinition {
+  readonly z: number;
+  readonly status: ContestantStatus;
+  readonly pose: ContestantPose;
+  readonly removedBy?: OperatorId;
+  readonly removalReason?: "correct" | "wrong";
 }
-
-export type TurnOutcome = "still" | "waving";
 
 export interface TurnAddress {
   readonly round: number;
@@ -56,109 +58,107 @@ export interface TurnAddress {
 export interface TurnRecordProvenance {
   readonly kind: "classical-demo";
   readonly provider: string;
-  readonly modelId: "dw-prepared-turn-v3";
+  readonly modelId: "dw-prepared-turn-v5";
   readonly preparedBeforePlay: true;
-  readonly bindingMethod: "stable-creature-id";
+  readonly bindingMethod: "stable-contestant-priority";
   readonly integrity: string;
 }
 
 export interface TurnRecord {
-  readonly schemaVersion: 3;
+  readonly schemaVersion: 5;
   readonly id: string;
   readonly bankId: string;
   readonly address: TurnAddress;
-  readonly outcomes: Readonly<Record<string, TurnOutcome>>;
+  readonly priority: readonly string[];
   readonly provenance: TurnRecordProvenance;
 }
 
-export interface ZapEvent {
+export type ShotOutcome = "correct" | "wrong" | "empty";
+
+export interface ShotEvent {
+  readonly id: number;
   readonly operator: OperatorId;
-  readonly creatureId: string;
-  readonly huntElapsedMs: number;
+  readonly targetId: string | null;
+  readonly outcome: ShotOutcome;
+  readonly phaseElapsedMs: number;
   readonly scoreDelta: number;
 }
 
 export interface TurnSummary {
-  readonly recordId: string;
-  readonly bankId: string;
   readonly address: TurnAddress;
-  readonly provenance: TurnRecordProvenance;
-  readonly greenElapsedMs: number;
+  readonly recordId: string;
   readonly forcedRed: boolean;
-  readonly wavingIds: readonly string[];
-  readonly stillIds: readonly string[];
-  readonly safeIds: readonly string[];
-  readonly escapedThisTurn: number;
-  readonly unresolvedWavingIds: readonly string[];
-  readonly zaps: readonly ZapEvent[];
+  readonly greenElapsedMs: number;
+  readonly ammoAtRed: number;
+  readonly revealedWavers: number;
+  readonly playerCorrect: number;
+  readonly playerWrong: number;
+  readonly leftHits: number;
+  readonly rightHits: number;
+  readonly unresolvedWavers: number;
+  readonly crossedThisTurn: number;
 }
 
 export interface PopulationCounts {
   readonly total: number;
   readonly active: number;
-  readonly safe: number;
-  readonly removed: number;
-  readonly survivors: number;
+  readonly evaporated: number;
+  readonly crossed: number;
 }
 
 export interface DontWaveState {
   readonly seed: number;
-  readonly bankId: string;
   readonly phase: DontWavePhase;
-  readonly paused: boolean;
   readonly round: number;
   readonly totalRounds: number;
   readonly turn: number;
   readonly turnsPerRound: number;
-  readonly greenElapsedMs: number;
+  readonly crowdRevision: number;
   readonly phaseElapsedMs: number;
-  readonly huntRemainingMs: number;
-  readonly sideOperatorStartsAtMs: number;
-  readonly canTriggerRed: boolean;
-  readonly creatures: readonly CreatureRuntimeState[];
-  readonly currentRecord: TurnRecord | null;
-  readonly revealedWavingIds: readonly string[];
-  readonly revealedStillIds: readonly string[];
-  readonly revealedSafeIds: readonly string[];
-  readonly turnZaps: readonly ZapEvent[];
+  readonly greenElapsedMs: number;
+  readonly canCallRed: boolean;
   readonly forcedRed: boolean;
+  readonly ammo: number;
+  readonly ammoAtRed: number;
+  readonly maxAmmo: number;
+  readonly chargeProgress: number;
+  readonly huntRemainingMs: number;
+  readonly contestants: readonly ContestantState[];
+  readonly currentRecord: TurnRecord | null;
+  readonly turnStartCrossed: number;
+  readonly revealedWavers: number;
+  readonly revealedStills: number;
+  readonly wavingRemaining: number;
+  readonly rivalShotsUsedLeft: number;
+  readonly rivalShotsUsedRight: number;
+  readonly turnPlayerCorrect: number;
+  readonly turnPlayerWrong: number;
+  readonly turnLeftHits: number;
+  readonly turnRightHits: number;
+  readonly playerScore: number;
+  readonly leftScore: number;
+  readonly rightScore: number;
+  readonly playerCorrect: number;
+  readonly playerWrong: number;
+  readonly emptyShots: number;
+  readonly events: readonly ShotEvent[];
   readonly history: readonly TurnSummary[];
   readonly counts: PopulationCounts;
-  readonly playerScore: number;
-  readonly playerHits: number;
-  readonly playerMisses: number;
-  readonly operatorHits: number;
-  readonly leftOperatorHits: number;
-  readonly rightOperatorHits: number;
-  readonly turnPlayerHits: number;
-  readonly turnLeftOperatorHits: number;
-  readonly turnRightOperatorHits: number;
-  readonly revealedWavers: number;
-  readonly wavingRemaining: number;
-  readonly turnSafeAtStart: number;
-  readonly turnEscaped: number;
-  readonly playerProgress: number;
   readonly playerMoving: boolean;
-  readonly playerStoppedAtRed: boolean;
+  readonly playerProgress: number;
   readonly statusMessage: string;
 }
 
-export type ZapCreatureResult =
-  | {
-      readonly accepted: true;
-      readonly event: ZapEvent;
-    }
-  | {
-      readonly accepted: false;
-      readonly reason: "not-hunting" | "paused" | "unknown-creature" | "not-waving" | "already-zapped";
-    };
+export type FireResult =
+  | { readonly fired: true; readonly event: ShotEvent }
+  | { readonly fired: false; readonly reason: "not-hunting" | "no-ammo" };
 
 export interface TurnBank {
-  readonly schemaVersion: 3;
-  readonly modelId: "dw-prepared-turn-v3";
+  readonly schemaVersion: 5;
+  readonly modelId: "dw-prepared-turn-v5";
   readonly bankId: string;
   readonly seed: number;
-  readonly creatureIds: readonly string[];
+  readonly contestantIds: readonly string[];
   getRecord(address: TurnAddress): TurnRecord;
   consume(address: TurnAddress): TurnRecord;
   resetConsumption(): void;

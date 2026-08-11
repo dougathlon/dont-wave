@@ -1,5 +1,4 @@
 import {
-  AdditiveBlending,
   CylinderGeometry,
   Group,
   Mesh,
@@ -91,7 +90,6 @@ export class BeamPool extends Group {
       depthTest: false,
       depthWrite: false,
       toneMapped: false,
-      blending: AdditiveBlending,
     });
     const impactMaterial = shaftMaterial.clone();
     const shaft = new Mesh(this.shaftGeometry, shaftMaterial);

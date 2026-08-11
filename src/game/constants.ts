@@ -1,46 +1,37 @@
 import { Color, Vector3 } from "three";
-import { FIELD_CHECKPOINT_Z, FIELD_COLUMNS, FIELD_ROWS } from "../content/fieldLayout";
 
-export const WORLD = {
-  fieldWidth: 30,
-  fieldNearZ: 13,
-  fieldFarZ: -17,
-  crossingStartZ: 12.6,
-  checkpointZ: FIELD_CHECKPOINT_Z,
-  columns: FIELD_COLUMNS,
-  rows: FIELD_ROWS,
-} as const;
-
-export const WATCH_CAMERA_POSITION = new Vector3(0, 12.6, 22.5);
-export const WATCH_CAMERA_TARGET = new Vector3(0, 1.05, -3.5);
-export const CROSSING_CAMERA_POSITION = new Vector3(0, 1.72, 13.2);
-export const CROSSING_CAMERA_TARGET = new Vector3(0, 1.48, -8.8);
+export const WATCH_CAMERA_POSITION = new Vector3(0, 10.8, 15.5);
+export const WATCH_CAMERA_TARGET = new Vector3(0, 1.1, -12.5);
+export const CROSSING_CAMERA_START = new Vector3(0, 1.68, -21);
+export const CROSSING_LOOK_TARGET = new Vector3(0, 1.35, 9);
+export const CROSSING_TRAVEL = 9;
 
 export const PALETTE = {
-  abyss: new Color(0x0c0810),
-  aubergine: new Color(0x24152b),
-  field: new Color(0x403049),
-  fieldDark: new Color(0x2a1c31),
-  cream: new Color(0xf2dfac),
-  dirtyCream: new Color(0xb9a77e),
-  coral: new Color(0xff786f),
-  cyan: new Color(0x65ded1),
-  chartreuse: new Color(0xb6cf5b),
-  ink: new Color(0x25172b),
-  rust: new Color(0x754853),
-  steel: new Color(0x5b5262),
-  warning: new Color(0xffb45d),
+  sky: new Color(0xaebfc0),
+  fog: new Color(0x87999a),
+  concrete: new Color(0xb7a98d),
+  concreteDark: new Color(0x6d675c),
+  bone: new Color(0xf2ead3),
+  ink: new Color(0x17191a),
+  green: new Color(0x84d34e),
+  red: new Color(0xe4473b),
+  left: new Color(0xf17867),
+  right: new Color(0x57c6cc),
+  yellow: new Color(0xe6bd4a),
+  rust: new Color(0x794d45),
+  civicBlue: new Color(0x3d6870),
 } as const;
 
 export const OPERATOR_COLORS = {
-  player: 0xf2dfac,
-  left: 0xff786f,
-  right: 0x65ded1,
-  miss: 0xffb45d,
+  player: 0xf2ead3,
+  wrong: 0xe6bd4a,
+  left: 0xf17867,
+  right: 0x57c6cc,
+  empty: 0xa9a093,
 } as const;
 
-export const MAX_FRAME_DELTA_MS = 100;
-export const MAX_PIXEL_RATIO = 1.5;
+export const MAX_FRAME_DELTA_MS = 50;
+export const MAX_PIXEL_RATIO = 1.6;
 
 export function stableHash(value: string): number {
   let hash = 2166136261;
@@ -49,11 +40,6 @@ export function stableHash(value: string): number {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
-}
-
-export function hashUnit(value: string, salt: number): number {
-  const mixed = stableHash(`${value}:${salt}`);
-  return mixed / 0xffffffff;
 }
 
 export function clamp01(value: number): number {

@@ -1,474 +1,407 @@
-import type { DontWavePhase, DontWaveState } from "../simulation/types";
-import { HUNT_MS } from "../simulation/DontWaveSession";
-
-const FOCUSABLE_SELECTOR = [
-  "button:not([disabled])",
-  "a[href]",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  "[tabindex]:not([tabindex='-1'])",
-].join(",");
+import type { DontWavePhase, DontWaveState, ShotEvent } from "../simulation/types";
 
 export interface DontWaveUIActions {
-  start(): void;
-  startGreen(): void;
-  triggerRed(): void;
-  continueFromReport(): void;
-  beginCrossing(): void;
-  setPlayerMoving(moving: boolean): void;
-  togglePause(): void;
-  restart(): void;
+  readonly start: () => void;
+  readonly startGreen: () => void;
+  readonly triggerRed: () => void;
+  readonly continueRound: () => void;
+  readonly leaveTower: () => void;
+  readonly beginCrossing: () => void;
+  readonly setPlayerMoving: (moving: boolean) => void;
+  readonly restart: () => void;
 }
 
 export interface ReticlePosition {
   readonly x: number;
   readonly y: number;
   readonly visible: boolean;
-  readonly canZap: boolean;
 }
+
+const FOCUSABLE = "button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex='-1'])";
 
 export class DontWaveUI {
   private readonly shell: HTMLElement;
   private readonly hud: HTMLElement;
-  private readonly controls: HTMLElement;
   private readonly overlay: HTMLElement;
-  private readonly huntMeter: HTMLElement;
-  private readonly reticle: HTMLElement;
-  private readonly status: HTMLElement;
+  private readonly controls: HTMLElement;
   private readonly greenButton: HTMLButtonElement;
   private readonly redButton: HTMLButtonElement;
   private readonly moveButton: HTMLButtonElement;
-  private readonly pauseButton: HTMLButtonElement;
+  private readonly reticle: HTMLElement;
+  private readonly feedback: HTMLElement;
+  private readonly chargePips: readonly HTMLElement[];
   private state: DontWaveState | null = null;
   private overlayKey = "";
-  private shotClassTimer = 0;
+  private lastPlayerEventId = 0;
+  private feedbackTimer = 0;
+  private movingPointerId: number | null = null;
   private systemNotice = "";
+  private reticleVisible = false;
 
   constructor(private readonly root: HTMLElement, private readonly actions: DontWaveUIActions) {
     root.innerHTML = shellMarkup();
-    this.shell = requiredElement(root, ".dw-shell");
-    this.hud = requiredElement(root, "[data-testid='hud']");
-    this.controls = requiredElement(root, ".dw-controls");
-    this.overlay = requiredElement(root, "[data-ui='overlay']");
-    this.huntMeter = requiredElement(root, "[data-ui='hunt-meter']");
-    this.reticle = requiredElement(root, "[data-ui='reticle']");
-    this.status = requiredElement(root, "[data-ui='status']");
-    this.greenButton = requiredElement(root, "[data-action='green']");
-    this.redButton = requiredElement(root, "[data-action='red']");
-    this.moveButton = requiredElement(root, "[data-action='move']");
-    this.pauseButton = requiredElement(root, "[data-action='pause']");
-
-    root.addEventListener("click", this.handleClick);
-    root.addEventListener("pointerdown", this.handlePointerDown);
-    root.addEventListener("pointerup", this.releaseMove);
-    root.addEventListener("pointercancel", this.releaseMove);
-    root.addEventListener("lostpointercapture", this.releaseMove);
-    root.addEventListener("keydown", this.handleModalKeyDown);
+    this.shell = required(root, ".dw-shell");
+    this.hud = required(root, "[data-ui='hud']");
+    this.overlay = required(root, "[data-ui='overlay']");
+    this.controls = required(root, "[data-ui='controls']");
+    this.greenButton = required(root, "[data-action='green']");
+    this.redButton = required(root, "[data-action='red']");
+    this.moveButton = required(root, "[data-action='move']");
+    this.reticle = required(root, "[data-ui='reticle']");
+    this.feedback = required(root, "[data-ui='feedback']");
+    this.chargePips = [...root.querySelectorAll<HTMLElement>("[data-ui='charge-pip']")];
+    root.addEventListener("click", this.onClick);
+    root.addEventListener("pointerdown", this.onPointerDown);
+    root.addEventListener("pointerup", this.onPointerRelease);
+    root.addEventListener("pointercancel", this.onPointerRelease);
+    root.addEventListener("lostpointercapture", this.onPointerRelease);
+    root.addEventListener("keydown", this.onModalKeyDown);
   }
 
   render(state: DontWaveState): void {
     this.state = state;
     this.shell.dataset.phase = state.phase;
-    this.shell.classList.toggle("is-paused", state.paused);
-    this.hud.hidden = state.phase === "briefing";
-
-    this.updateText("round", `${state.round} / ${state.totalRounds}`);
-    this.updateText("turn", `${state.turn} / ${state.turnsPerRound}`);
-    this.updateText("player-score", state.playerScore.toLocaleString("en-GB"));
-    this.updateText("operator-score", (state.operatorHits * 100).toLocaleString("en-GB"));
-    this.updateText("escaped", String(state.counts.safe));
-    this.updateText("phase", phaseLabel(state.phase, state.paused));
-    this.updateText("callout", calloutText(state));
-
-    const inResolution = state.phase === "reveal" || state.phase === "hunt";
-    this.huntMeter.hidden = !inResolution;
-    if (inResolution) {
-      const progress = state.phase === "reveal"
-        ? 100
-        : clamp((state.huntRemainingMs / HUNT_MS) * 100, 0, 100);
-      this.huntMeter.style.setProperty("--hunt-progress", `${progress}%`);
-      this.updateText("targets", String(state.wavingRemaining));
-      this.updateText(
-        "hunt-owner",
-        state.phase === "reveal"
-          ? "READ THE FIELD"
-          : state.phaseElapsedMs >= state.sideOperatorStartsAtMs
-            ? "SIDE TOWERS ACTIVE"
-            : "YOUR WINDOW",
-      );
-    }
-
-    this.reticle.hidden = state.phase !== "hunt";
+    this.hud.hidden = hasOverlay(state.phase);
+    this.controls.hidden = hasOverlay(state.phase);
+    this.text("round", `${state.round} / ${state.totalRounds}`);
+    this.text("turn", `${state.turn} / ${state.turnsPerRound}`);
+    this.text("player-score", score(state.playerScore));
+    this.text("left-score", score(state.leftScore));
+    this.text("right-score", score(state.rightScore));
+    this.text("phase", phaseLabel(state.phase));
+    this.text("announcement", announcement(state));
+    this.text("timer", timerText(state));
+    this.text("ammo", `${state.ammo} / ${state.maxAmmo}`);
+    this.text("status", this.systemNotice || statusText(state));
+    this.updateCharge(state);
     this.updateControls(state);
-    this.updateStatus(state);
+    this.updateFeedback(state);
     this.renderOverlay(state);
+    this.reticle.hidden = !(this.reticleVisible && state.phase === "hunt");
   }
 
   setReticle(position: ReticlePosition): void {
-    this.shell.style.setProperty("--reticle-x", `${clamp(position.x, 0, 1) * 100}%`);
-    this.shell.style.setProperty("--reticle-y", `${clamp(position.y, 0, 1) * 100}%`);
-    this.reticle.dataset.canZap = String(position.canZap);
-    this.reticle.classList.toggle("is-target", position.canZap);
-    if (this.state?.phase === "hunt") this.reticle.hidden = !position.visible;
+    this.reticleVisible = position.visible;
+    this.shell.style.setProperty("--reticle-x", `${clamp(position.x) * 100}%`);
+    this.shell.style.setProperty("--reticle-y", `${clamp(position.y) * 100}%`);
+    this.reticle.hidden = !(this.reticleVisible && this.state?.phase === "hunt");
   }
 
-  flashShot(accepted: boolean): void {
-    window.clearTimeout(this.shotClassTimer);
-    this.shell.classList.remove("is-hit", "is-miss");
-    this.shell.classList.add(accepted ? "is-hit" : "is-miss");
-    this.updateText("shot-feedback", accepted ? "+100" : "MISS");
-    this.shotClassTimer = window.setTimeout(() => {
-      this.shell.classList.remove("is-hit", "is-miss");
-      this.updateText("shot-feedback", "");
-    }, 180);
+  flashDryFire(): void {
+    this.showFeedback("NO CHARGE", "dry");
   }
 
   setSystemNotice(message: string): void {
     this.systemNotice = message;
-    if (this.state) this.updateStatus(this.state);
+    if (this.state) this.text("status", message || statusText(this.state));
   }
 
   destroy(): void {
-    window.clearTimeout(this.shotClassTimer);
+    window.clearTimeout(this.feedbackTimer);
     this.actions.setPlayerMoving(false);
-    this.root.removeEventListener("click", this.handleClick);
-    this.root.removeEventListener("pointerdown", this.handlePointerDown);
-    this.root.removeEventListener("pointerup", this.releaseMove);
-    this.root.removeEventListener("pointercancel", this.releaseMove);
-    this.root.removeEventListener("lostpointercapture", this.releaseMove);
-    this.root.removeEventListener("keydown", this.handleModalKeyDown);
-    this.setBackgroundInert(false);
+    this.root.removeEventListener("click", this.onClick);
+    this.root.removeEventListener("pointerdown", this.onPointerDown);
+    this.root.removeEventListener("pointerup", this.onPointerRelease);
+    this.root.removeEventListener("pointercancel", this.onPointerRelease);
+    this.root.removeEventListener("lostpointercapture", this.onPointerRelease);
+    this.root.removeEventListener("keydown", this.onModalKeyDown);
     this.root.replaceChildren();
+  }
+
+  private updateCharge(state: DontWaveState): void {
+    this.chargePips.forEach((pip, index) => {
+      pip.classList.toggle("is-filled", index < state.ammo);
+      pip.classList.toggle("is-spent", state.phase === "hunt" && index >= state.ammo && index < state.ammoAtRed);
+    });
   }
 
   private updateControls(state: DontWaveState): void {
     this.greenButton.hidden = state.phase !== "ready";
-    this.greenButton.disabled = state.paused;
     this.redButton.hidden = state.phase !== "green";
-    this.redButton.disabled = state.paused || !state.canTriggerRed;
-    this.redButton.querySelector("small")!.textContent = state.canTriggerRed
-      ? "R · CHOOSE THE MOMENT"
-      : "R · WAIT FOR ARMING";
+    this.redButton.disabled = !state.canCallRed;
+    this.redButton.querySelector("small")!.textContent = state.canCallRed
+      ? "R · STOP THE FIELD"
+      : "CHARGING";
     this.moveButton.hidden = state.phase !== "crossing-green";
-    this.moveButton.disabled = state.paused;
     this.moveButton.classList.toggle("is-held", state.playerMoving);
     this.moveButton.setAttribute("aria-pressed", String(state.playerMoving));
-    this.moveButton.setAttribute("aria-label", state.playerMoving ? "Stop crossing" : "Start crossing");
-    this.pauseButton.disabled = !isPausable(state.phase);
-    this.pauseButton.textContent = state.paused ? "▶" : "Ⅱ";
-    this.pauseButton.setAttribute("aria-label", state.paused ? "Resume game" : "Pause game");
   }
 
-  private updateStatus(state: DontWaveState): void {
-    const message = this.systemNotice || state.statusMessage;
-    if (this.status.textContent !== message) this.status.textContent = message;
+  private updateFeedback(state: DontWaveState): void {
+    const event = [...state.events].reverse().find((candidate) => candidate.operator === "player");
+    if (!event || event.id <= this.lastPlayerEventId) return;
+    this.lastPlayerEventId = event.id;
+    this.presentShot(event);
+  }
+
+  private presentShot(event: ShotEvent): void {
+    if (event.outcome === "correct") this.showFeedback("+100", "correct");
+    else if (event.outcome === "wrong") this.showFeedback("−100", "wrong");
+    else this.showFeedback("EMPTY", "empty");
+  }
+
+  private showFeedback(message: string, kind: string): void {
+    window.clearTimeout(this.feedbackTimer);
+    this.feedback.textContent = message;
+    this.feedback.dataset.kind = kind;
+    this.feedback.hidden = false;
+    this.feedbackTimer = window.setTimeout(() => {
+      this.feedback.hidden = true;
+      this.feedback.textContent = "";
+      delete this.feedback.dataset.kind;
+    }, 420);
   }
 
   private renderOverlay(state: DontWaveState): void {
-    const overlayState = state.paused ? "paused" : overlayPhase(state.phase);
-    const key = `${overlayState}:${state.round}:${state.turn}:${state.playerScore}:${state.operatorHits}:${state.counts.survivors}`;
-    if (!overlayState) {
+    const overlayPhase = hasOverlay(state.phase) ? state.phase : "";
+    const key = `${overlayPhase}:${state.round}:${state.crowdRevision}:${state.playerScore}:${state.leftScore}:${state.rightScore}`;
+    if (!overlayPhase) {
       if (!this.overlay.hidden) this.closeOverlay();
       this.overlayKey = key;
       return;
     }
-    if (this.overlayKey === key) return;
+    if (key === this.overlayKey) return;
     this.overlayKey = key;
-    this.setBackgroundInert(true);
+    this.hud.inert = true;
+    this.controls.inert = true;
     this.overlay.hidden = false;
-    this.overlay.innerHTML = overlayMarkup(overlayState, state);
-    const title = requiredElement<HTMLElement>(this.overlay, ".dw-modal-focus");
-    title.id = "dw-overlay-title";
+    this.overlay.innerHTML = overlayMarkup(state);
+    const heading = required<HTMLElement>(this.overlay, ".dw-modal-focus");
+    heading.id = "dw-overlay-title";
     this.overlay.setAttribute("role", "dialog");
     this.overlay.setAttribute("aria-modal", "true");
-    this.overlay.setAttribute("aria-labelledby", title.id);
-    window.requestAnimationFrame(() => {
-      title.focus({ preventScroll: true });
-    });
+    this.overlay.setAttribute("aria-labelledby", heading.id);
+    window.requestAnimationFrame(() => heading.focus({ preventScroll: true }));
   }
 
   private closeOverlay(): void {
-    this.setBackgroundInert(false);
+    this.hud.inert = false;
+    this.controls.inert = false;
     this.overlay.hidden = true;
+    this.overlay.replaceChildren();
     this.overlay.removeAttribute("role");
     this.overlay.removeAttribute("aria-modal");
     this.overlay.removeAttribute("aria-labelledby");
-    this.overlay.replaceChildren();
-    window.requestAnimationFrame(() => {
-      // Give global game verbs Space again after a modal closes. Restoring the
-      // pause trigger would make Space reopen that modal instead of firing.
-      this.shell.focus({ preventScroll: true });
-    });
+    window.requestAnimationFrame(() => this.shell.focus({ preventScroll: true }));
   }
 
-  private setBackgroundInert(inert: boolean): void {
-    this.hud.inert = inert;
-    this.controls.inert = inert;
-  }
-
-  private updateText(key: string, value: string): void {
-    const element = requiredElement(this.root, `[data-ui='${key}']`);
+  private text(key: string, value: string): void {
+    const element = required(this.root, `[data-ui='${key}']`);
     if (element.textContent !== value) element.textContent = value;
   }
 
-  private handleClick = (event: MouseEvent): void => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const button = target.closest<HTMLButtonElement>("button");
-    if (!button || button.disabled || !this.root.contains(button)) return;
-    switch (button.dataset.action) {
-      case "start":
-        this.actions.start();
-        break;
-      case "green":
-        this.actions.startGreen();
-        break;
-      case "red":
-        this.actions.triggerRed();
-        break;
-      case "continue-report":
-        this.actions.continueFromReport();
-        break;
-      case "begin-crossing":
-        this.actions.beginCrossing();
-        break;
+  private readonly onClick = (event: MouseEvent): void => {
+    const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button") : null;
+    if (!target || target.disabled || !this.root.contains(target)) return;
+    switch (target.dataset.action) {
+      case "start": this.actions.start(); break;
+      case "green": this.actions.startGreen(); break;
+      case "red": this.actions.triggerRed(); break;
+      case "continue-round": this.actions.continueRound(); break;
+      case "leave-tower": this.actions.leaveTower(); break;
+      case "begin-crossing": this.actions.beginCrossing(); break;
+      case "restart": this.lastPlayerEventId = 0; this.actions.restart(); break;
       case "move":
-        // Pointer users get momentary hold semantics from pointerdown/up. A
-        // zero-detail click is keyboard or assistive activation and toggles.
         if (event.detail === 0) this.actions.setPlayerMoving(!(this.state?.playerMoving ?? false));
-        break;
-      case "pause":
-      case "resume":
-        this.actions.togglePause();
-        break;
-      case "restart":
-        this.actions.restart();
         break;
     }
   };
 
-  private handlePointerDown = (event: PointerEvent): void => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const button = target.closest<HTMLButtonElement>("[data-action='move']");
+  private readonly onPointerDown = (event: PointerEvent): void => {
+    const button = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>("[data-action='move']")
+      : null;
     if (!button || button.disabled || !this.root.contains(button)) return;
     event.preventDefault();
+    this.movingPointerId = event.pointerId;
     button.setPointerCapture(event.pointerId);
     this.actions.setPlayerMoving(true);
   };
 
-  private releaseMove = (event: PointerEvent): void => {
-    if (!this.state?.playerMoving) return;
-    const target = event.target;
-    if (target instanceof Element && target.closest("[data-action='move']")) {
-      this.actions.setPlayerMoving(false);
-    }
+  private readonly onPointerRelease = (event: PointerEvent): void => {
+    if (this.movingPointerId !== event.pointerId) return;
+    this.movingPointerId = null;
+    this.actions.setPlayerMoving(false);
   };
 
-  private handleModalKeyDown = (event: KeyboardEvent): void => {
+  private readonly onModalKeyDown = (event: KeyboardEvent): void => {
     if (event.key !== "Tab" || this.overlay.hidden) return;
-    const focusable = [...this.overlay.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)]
-      .filter((element) => isRestorableFocusTarget(element));
+    const focusable = [...this.overlay.querySelectorAll<HTMLElement>(FOCUSABLE)]
+      .filter((element) => element.getClientRects().length > 0);
     if (focusable.length === 0) {
       event.preventDefault();
-      this.overlay.querySelector<HTMLElement>(".dw-modal-focus")?.focus({ preventScroll: true });
+      this.overlay.querySelector<HTMLElement>(".dw-modal-focus")?.focus();
       return;
     }
-
-    const active = document.activeElement;
-    const activeIndex = active instanceof HTMLElement ? focusable.indexOf(active) : -1;
-    if (activeIndex === -1 || (!event.shiftKey && activeIndex === focusable.length - 1) || (event.shiftKey && activeIndex === 0)) {
+    const index = focusable.indexOf(document.activeElement as HTMLElement);
+    if ((!event.shiftKey && index === focusable.length - 1) || (event.shiftKey && index <= 0)) {
       event.preventDefault();
-      const target = event.shiftKey ? focusable[focusable.length - 1] : focusable[0];
-      target?.focus({ preventScroll: true });
+      (event.shiftKey ? focusable.at(-1) : focusable[0])?.focus();
     }
   };
 }
 
 function shellMarkup(): string {
   return `
-    <div class="dw-shell" tabindex="-1" data-phase="briefing">
-      <header class="dw-hud" data-testid="hud" hidden>
-        <div class="dw-hud__run">
-          <span><small>Round</small><strong data-ui="round">1 / 2</strong></span>
-          <span><small>Turn</small><strong data-ui="turn">1 / 4</strong></span>
-        </div>
-        <div class="dw-phase-chip" data-ui="phase-chip"><i aria-hidden="true"></i><span data-ui="phase">Ready</span></div>
-        <div class="dw-hud__right">
-          <div class="dw-hud__scores" aria-label="Score">
-            <span class="dw-score dw-score--player"><small>You</small><strong data-ui="player-score">0</strong></span>
-            <span class="dw-score dw-score--operators"><small>Towers</small><strong data-ui="operator-score">0</strong></span>
-            <span class="dw-score dw-score--escaped"><small>Escaped</small><strong data-ui="escaped">0</strong></span>
-          </div>
-          <button class="dw-pause-button" type="button" data-action="pause" aria-label="Pause game">Ⅱ</button>
+    <div class="dw-shell" data-phase="briefing" tabindex="-1">
+      <header class="dw-hud" data-ui="hud" hidden>
+        <div class="dw-run"><span>ROUND <b data-ui="round">1 / 2</b></span><span>TURN <b data-ui="turn">1 / 4</b></span></div>
+        <div class="dw-phase"><i></i><b data-ui="phase">READY</b></div>
+        <div class="dw-scores" aria-label="Scores">
+          <span class="dw-score dw-score--you"><small>YOU</small><b data-ui="player-score">0</b></span>
+          <span class="dw-score dw-score--left"><small>LEFT</small><b data-ui="left-score">0</b></span>
+          <span class="dw-score dw-score--right"><small>RIGHT</small><b data-ui="right-score">0</b></span>
         </div>
       </header>
 
-      <div class="dw-hunt-meter" data-ui="hunt-meter" hidden>
-        <div class="dw-hunt-meter__label"><span data-ui="hunt-owner">YOUR WINDOW</span><span><b data-ui="targets">0</b> REMAIN</span></div>
-        <span class="dw-hunt-meter__rail"><i></i></span>
-      </div>
-
+      <strong class="dw-announcement" data-ui="announcement" aria-live="assertive"></strong>
+      <span class="dw-timer" data-ui="timer"></span>
       <div class="dw-reticle" data-ui="reticle" aria-hidden="true" hidden></div>
-      <strong class="dw-shot-feedback" data-ui="shot-feedback" aria-hidden="true"></strong>
-      <p class="dw-callout" data-ui="callout" aria-live="polite"></p>
+      <strong class="dw-feedback" data-ui="feedback" aria-live="assertive" hidden></strong>
+
+      <div class="dw-charge" aria-label="Gun charge">
+        <span class="dw-charge__label">CHARGE <b data-ui="ammo">0 / 6</b></span>
+        <span class="dw-charge__pips">
+          ${Array.from({ length: 6 }, () => '<i data-ui="charge-pip"></i>').join("")}
+        </span>
+      </div>
       <p class="dw-status" data-ui="status" aria-live="polite"></p>
 
-      <div class="dw-controls">
-        <button class="dw-action dw-action--green" type="button" data-action="green" data-testid="green" hidden>GREEN<small>G · RELEASE THE FIELD</small></button>
-        <button class="dw-action dw-action--red" type="button" data-action="red" data-testid="red" hidden>RED<small>R · CHOOSE THE MOMENT</small></button>
-        <button class="dw-action dw-action--move" type="button" data-action="move" data-testid="move" aria-pressed="false" aria-label="Start crossing" hidden>HOLD TO CROSS<small>W / SPACE · RELEASE TO STOP</small></button>
+      <div class="dw-controls" data-ui="controls">
+        <button class="dw-action dw-action--green" type="button" data-action="green" data-testid="green" hidden>
+          GREEN LIGHT<small>G · START THE CROSSING</small>
+        </button>
+        <button class="dw-action dw-action--red" type="button" data-action="red" data-testid="red" hidden disabled>
+          RED LIGHT<small>CHARGING</small>
+        </button>
+        <button class="dw-action dw-action--move" type="button" data-action="move" data-testid="move" aria-pressed="false" hidden>
+          HOLD TO WALK<small>W / SPACE</small>
+        </button>
       </div>
 
-      <p class="dw-orientation-note">Landscape gives the clearest view of both side towers.</p>
+      <p class="dw-orientation">LANDSCAPE RECOMMENDED</p>
       <div class="dw-death-wash" aria-hidden="true"></div>
-      <section class="dw-overlay" data-ui="overlay" aria-live="polite" hidden></section>
+      <section class="dw-overlay" data-ui="overlay" hidden></section>
     </div>`;
 }
 
-function overlayMarkup(kind: string, state: DontWaveState): string {
-  if (kind === "briefing") {
+function overlayMarkup(state: DontWaveState): string {
+  if (state.phase === "briefing") {
     return `
       <div class="dw-panel" data-testid="briefing">
-        <p class="dw-kicker">CIVIC PLAYGROUND 07 / TOWER CONTROL</p>
-        <h1 class="dw-modal-focus" tabindex="-1"><span>DON'T</span><br>WAVE</h1>
-        <p class="dw-deck">You control the crossing. The towers keep score.</p>
-        <div class="dw-loop" aria-label="Game loop">
-          <span><b>01</b><strong>GREEN</strong><small>Let them run.</small></span>
-          <span><b>02</b><strong>RED</strong><small>Make them resolve.</small></span>
-          <span><b>03</b><strong>ZAP</strong><small>Click anyone waving before the towers do.</small></span>
-        </div>
-        <div class="dw-panel__actions">
-          <button class="dw-primary" type="button" data-action="start" data-testid="start">TAKE THE TOWER →</button>
-        </div>
-        <p class="dw-local-note">Concept prototype · public playtest · no live connection</p>
+        <p class="dw-kicker">WATCHTOWER SHIFT 01</p>
+        <h1 class="dw-modal-focus" tabindex="-1">DON'T<br><em>WAVE</em></h1>
+        <p class="dw-deck">Call <b>GREEN LIGHT</b>. Let the gun charge. Call <b>RED LIGHT</b>. Zap the wavers before the two towers do.</p>
+        <button class="dw-primary" type="button" data-action="start" data-testid="start">TAKE THE TOWER</button>
       </div>`;
   }
-  if (kind === "paused") {
+  if (state.phase === "round-break") {
     return `
-      <div class="dw-panel dw-panel--compact">
-        <p class="dw-kicker">CONTROL INTERRUPT</p>
-        <h2 class="dw-modal-focus" tabindex="-1">TOWER HELD</h2>
-        <p class="dw-deck">The field and side operators are paused. Held movement has been cleared.</p>
-        ${summaryMarkup(state)}
-        <div class="dw-panel__actions">
-          <button class="dw-primary" type="button" data-action="resume" data-testid="resume">RESUME →</button>
-          <button class="dw-secondary" type="button" data-action="restart">RESTART RUN</button>
-        </div>
+      <div class="dw-panel dw-panel--compact" data-testid="round-break">
+        <p class="dw-kicker">ROUND ONE COMPLETE</p>
+        <h2 class="dw-modal-focus" tabindex="-1">NEW CROWD</h2>
+        ${standings(state)}
+        <button class="dw-primary" type="button" data-action="continue-round" data-testid="continue-round">OPEN ROUND TWO</button>
       </div>`;
   }
-  if (kind === "report") {
-    const summary = state.history[state.history.length - 1];
-    const finalTurn = state.round === state.totalRounds && state.turn === state.turnsPerRound;
-    const roundComplete = state.turn === state.turnsPerRound;
+  if (state.phase === "final-standings") {
     return `
-      <div class="dw-panel dw-panel--compact" data-testid="report">
-        <p class="dw-kicker">ROUND ${pad(state.round)} / TURN ${pad(state.turn)} REPORT</p>
-        <h2 class="dw-modal-focus" tabindex="-1">${finalTurn ? "SHIFT COMPLETE" : roundComplete ? "ROUND COMPLETE" : "FIELD HELD"}</h2>
-        ${turnReportMarkup(state, summary)}
-        <div class="dw-panel__actions"><button class="dw-primary" type="button" data-action="continue-report" data-testid="continue-report">${finalTurn ? "LEAVE THE TOWER" : roundComplete ? "OPEN ROUND TWO" : "NEXT TURN"} →</button></div>
+      <div class="dw-panel dw-panel--compact" data-testid="final-standings">
+        <p class="dw-kicker">FINAL STANDINGS</p>
+        <h2 class="dw-modal-focus" tabindex="-1">${leader(state)}</h2>
+        ${standings(state)}
+        <button class="dw-primary" type="button" data-action="leave-tower" data-testid="leave-tower">LEAVE THE TOWER</button>
       </div>`;
   }
-  if (kind === "crossing-ready") {
+  if (state.phase === "crossing-ready") {
     return `
       <div class="dw-panel dw-panel--compact" data-testid="crossing-ready">
-        <p class="dw-kicker">TOWER EXIT / FIELD LEVEL</p>
-        <h2 class="dw-modal-focus" tabindex="-1">YOUR TURN</h2>
-        <p class="dw-deck">The lift opens onto the same concrete. Hold to cross when the field turns green. Release when it stops.</p>
-        <div class="dw-panel__actions"><button class="dw-primary" type="button" data-action="begin-crossing" data-testid="begin-crossing">ENTER THE FIELD →</button></div>
+        <p class="dw-kicker">FIELD LEVEL</p>
+        <h2 class="dw-modal-focus" tabindex="-1">WALK FORWARD</h2>
+        <p class="dw-deck">Hold forward when the light turns green.</p>
+        <button class="dw-primary" type="button" data-action="begin-crossing" data-testid="begin-crossing">ENTER THE FIELD</button>
       </div>`;
   }
   return `
     <div class="dw-panel dw-panel--compact" data-testid="complete">
-      <p class="dw-kicker">PERSONNEL RECOVERED / RUN CLOSED</p>
-      <h2 class="dw-modal-focus" tabindex="-1">THE TOWER CONTINUES.</h2>
-      ${summaryMarkup(state)}
-      <div class="dw-panel__actions"><button class="dw-primary" type="button" data-action="restart" data-testid="restart">RUN AGAIN →</button></div>
+      <p class="dw-kicker">SHIFT CLOSED</p>
+      <h2 class="dw-modal-focus" tabindex="-1">DON'T WAVE</h2>
+      ${standings(state)}
+      <button class="dw-primary" type="button" data-action="restart" data-testid="restart">PLAY AGAIN</button>
     </div>`;
 }
 
-function summaryMarkup(state: DontWaveState): string {
+function standings(state: DontWaveState): string {
   return `
-    <div class="dw-summary-grid">
-      <span class="dw-stat"><small>Your score</small><strong>${state.playerScore.toLocaleString("en-GB")}</strong></span>
-      <span class="dw-stat"><small>Your hits</small><strong>${state.playerHits}</strong></span>
-      <span class="dw-stat"><small>Tower score</small><strong>${(state.operatorHits * 100).toLocaleString("en-GB")}</strong></span>
-      <span class="dw-stat"><small>Escaped</small><strong>${state.counts.safe}</strong></span>
+    <div class="dw-standings">
+      <span class="dw-score--you"><small>YOU</small><b>${score(state.playerScore)}</b></span>
+      <span class="dw-score--left"><small>LEFT</small><b>${score(state.leftScore)}</b></span>
+      <span class="dw-score--right"><small>RIGHT</small><b>${score(state.rightScore)}</b></span>
     </div>`;
 }
 
-function turnReportMarkup(state: DontWaveState, summary: DontWaveState["history"][number] | undefined): string {
-  const towerHits = state.turnLeftOperatorHits + state.turnRightOperatorHits;
-  return `
-    <div class="dw-summary-grid dw-summary-grid--report">
-      <span class="dw-stat"><small>You hit</small><strong>${state.turnPlayerHits}</strong></span>
-      <span class="dw-stat"><small>Towers hit</small><strong>${towerHits}</strong></span>
-      <span class="dw-stat dw-stat--escaped"><small>Escaped this turn</small><strong>${summary?.escapedThisTurn ?? 0}</strong></span>
-      <span class="dw-stat"><small>Wavers left</small><strong>${summary?.unresolvedWavingIds.length ?? 0}</strong></span>
-    </div>`;
+function leader(state: DontWaveState): string {
+  const maximum = Math.max(state.playerScore, state.leftScore, state.rightScore);
+  const leaders = [state.playerScore, state.leftScore, state.rightScore]
+    .map((value, index) => ({ value, index }))
+    .filter(({ value }) => value === maximum);
+  if (leaders.length > 1) {
+    return leaders.some(({ index }) => index === 0) ? "TIED FOR FIRST" : "TOWERS TIED";
+  }
+  if (state.playerScore === maximum) return "YOU LEAD";
+  return state.leftScore > state.rightScore ? "LEFT TOWER LEADS" : "RIGHT TOWER LEADS";
 }
 
-function overlayPhase(phase: DontWavePhase): string {
-  if (phase === "briefing" || phase === "report" || phase === "crossing-ready" || phase === "complete") return phase;
+function hasOverlay(phase: DontWavePhase): boolean {
+  return phase === "briefing"
+    || phase === "round-break"
+    || phase === "final-standings"
+    || phase === "crossing-ready"
+    || phase === "complete";
+}
+
+function phaseLabel(phase: DontWavePhase): string {
+  if (phase === "green" || phase === "crossing-green") return "GREEN";
+  if (phase === "reveal" || phase === "hunt" || phase === "rivals" || phase === "crossing-red") return "RED";
+  if (phase === "death") return "HIT";
+  if (phase === "descent") return "DESCENT";
+  return "READY";
+}
+
+function announcement(state: DontWaveState): string {
+  if (state.phase === "green" || state.phase === "crossing-green") return "GREEN LIGHT";
+  if (state.phase === "reveal" || state.phase === "crossing-red") return "RED LIGHT";
+  if (state.phase === "hunt") return "FIRE";
+  if (state.phase === "rivals") return "TOWERS";
   return "";
 }
 
-function phaseLabel(phase: DontWavePhase, paused: boolean): string {
-  if (paused) return "HELD";
-  switch (phase) {
-    case "briefing": return "OFF DUTY";
-    case "ready": return "READY";
-    case "green": return "GREEN";
-    case "reveal":
-    case "crossing-red": return "RED";
-    case "hunt": return "CLEAR";
-    case "report": return "TURN REPORT";
-    case "descent": return "DESCENDING";
-    case "crossing-ready": return "FIELD ENTRY";
-    case "crossing-green": return "GREEN";
-    case "death": return "HIT";
-    case "complete": return "CLOSED";
-  }
-}
-
-function calloutText(state: DontWaveState): string {
-  if (state.paused) return "";
-  if (state.phase === "ready") return state.history.length === 0 ? "1 / RELEASE THE FIELD" : "GREEN / RELEASE THE FIELD";
-  if (state.phase === "green") {
-    return state.canTriggerRed
-      ? state.history.length === 0 ? "2 / CALL RED — WAITING LETS MORE ESCAPE" : "CALL RED — OR LET MORE ESCAPE"
-      : "WATCH THE GATE";
-  }
-  if (state.phase === "reveal") return "WATCH WHO MOVES";
-  if (state.phase === "hunt") return state.history.length === 0 ? "3 / CLICK THE WAVERS" : "CLICK THE WAVERS";
-  if (state.phase === "crossing-green") return "HOLD TO MOVE — RELEASE TO STOP";
-  if (state.phase === "crossing-red") return state.playerStoppedAtRed ? "YOU STOPPED" : "YOU WERE MOVING";
-  if (state.phase === "death") return "";
+function timerText(state: DontWaveState): string {
+  if (state.phase === "hunt") return `${(state.huntRemainingMs / 1_000).toFixed(1)}s`;
+  if (state.phase === "green") return state.canCallRed ? "RED READY" : "CHARGING";
   return "";
 }
 
-function pad(value: number): string {
-  return String(value).padStart(2, "0");
+function statusText(state: DontWaveState): string {
+  if (state.phase === "ready") return "CALL GREEN LIGHT";
+  if (state.phase === "green") return state.ammo === state.maxAmmo ? "FULL CHARGE" : "WAIT FOR CHARGE — OR CALL RED";
+  if (state.phase === "reveal") return "WATCH THE ARMS";
+  if (state.phase === "hunt") return "CLICK THE WAVERS";
+  if (state.phase === "rivals") return "RIVAL VOLLEY";
+  if (state.phase === "crossing-green") return "HOLD FORWARD";
+  return state.statusMessage;
 }
 
-function isPausable(phase: DontWavePhase): boolean {
-  return phase !== "briefing" && phase !== "complete" && phase !== "death";
+function score(value: number): string {
+  return value.toLocaleString("en-GB");
 }
 
-function requiredElement<T extends Element = HTMLElement>(root: ParentNode, selector: string): T {
+function required<T extends Element = HTMLElement>(root: ParentNode, selector: string): T {
   const element = root.querySelector<T>(selector);
   if (!element) throw new Error(`Don't Wave UI is missing ${selector}.`);
   return element;
 }
 
-function isRestorableFocusTarget(element: HTMLElement | null): element is HTMLElement {
-  if (!element?.isConnected || element.closest("[inert]")) return false;
-  if (element.matches(":disabled, [hidden], [aria-hidden='true']")) return false;
-  if (element !== document.body && element.getClientRects().length === 0) return false;
-  return element.matches(FOCUSABLE_SELECTOR);
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.max(minimum, Math.min(maximum, value));
+function clamp(value: number): number {
+  return Math.max(0, Math.min(1, value));
 }

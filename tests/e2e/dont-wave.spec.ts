@@ -1,7 +1,10 @@
 import { expect, test as base, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { DontWaveState, ZapCreatureResult } from "../../src/simulation/types";
+import type { CameraSnapshot } from "../../src/game/CameraDirector";
+import type { ContestantProjection } from "../../src/game/DontWaveWorld";
+import { CROSSING_GREEN_MS, CROSSING_RED_MS, DEATH_MS } from "../../src/simulation/DontWaveSession";
+import type { DontWaveState, FireResult } from "../../src/simulation/types";
 
 interface RuntimeFixtures {
   runtimeErrors: string[];
@@ -13,14 +16,15 @@ interface DontWaveRuntime {
   startGreen(): DontWaveState;
   triggerRed(): DontWaveState;
   advance(milliseconds: number): DontWaveState;
-  zapCreature(creatureId: string): ZapCreatureResult;
-  registerMiss(): DontWaveState;
-  continueFromReport(): DontWaveState;
+  fire(targetId: string | null): FireResult;
+  continueRound(): DontWaveState;
+  leaveTower(): DontWaveState;
   beginCrossing(): DontWaveState;
   setPlayerMoving(moving: boolean): DontWaveState;
-  togglePause(): DontWaveState;
   restart(seed?: number): DontWaveState;
   fireAtReticle(): boolean;
+  projectContestant(id: string): ContestantProjection | null;
+  cameraSnapshot(): CameraSnapshot;
 }
 
 declare global {
@@ -37,9 +41,7 @@ const test = base.extend<RuntimeFixtures>({
         if (message.type() === "error") errors.push(`console: ${message.text()}`);
       });
       page.on("pageerror", (error) => errors.push(`page: ${error.message}`));
-      page.on("requestfailed", (request) => {
-        errors.push(`request: ${request.url()} (${request.failure()?.errorText ?? "failed"})`);
-      });
+      page.on("requestfailed", (request) => errors.push(`request: ${request.url()} (${request.failure()?.errorText ?? "failed"})`));
       await use(errors);
       expect(errors, "The browser emitted runtime, console, or asset-loading errors.").toEqual([]);
     },
@@ -47,330 +49,209 @@ const test = base.extend<RuntimeFixtures>({
   ],
 });
 
-const SCREENSHOT_DIRECTORY = resolve(process.cwd(), "test-results/screenshots-v0.3");
+const SCREENSHOTS = resolve(process.cwd(), "test-results/screenshots-v0.4-reset");
 
 async function boot(page: Page): Promise<void> {
-  await page.goto("?seed=7071", { waitUntil: "networkidle" });
+  await page.goto("?seed=7071&clock=manual", { waitUntil: "networkidle" });
   await page.waitForFunction(() => Boolean(window.__DONT_WAVE__));
   const canvas = page.locator("canvas");
   await expect(canvas).toBeVisible();
-  await expect(canvas).toHaveAttribute("aria-label", "Don't Wave watchtower view over the civic playground");
-  await expect(page.getByRole("dialog")).toHaveAttribute("aria-modal", "true");
+  await expect(canvas).toHaveAttribute("aria-label", /Fixed watchtower view/);
+  await expect(page.getByTestId("briefing")).toBeVisible();
   await expect(page.getByRole("heading", { name: "DON'T WAVE" })).toBeVisible();
-  const canvasBounds = await canvas.boundingBox();
-  expect(canvasBounds?.width ?? 0).toBeGreaterThan(300);
-  expect(canvasBounds?.height ?? 0).toBeGreaterThan(240);
-}
-
-async function capture(page: Page, filename: string): Promise<void> {
-  await mkdir(SCREENSHOT_DIRECTORY, { recursive: true });
-  await page.screenshot({
-    path: resolve(SCREENSHOT_DIRECTORY, filename),
-    fullPage: true,
-    animations: "disabled",
-  });
 }
 
 async function advance(page: Page, milliseconds: number): Promise<DontWaveState> {
-  return page.evaluate((duration) => window.__DONT_WAVE__.advance(duration), milliseconds);
+  const state = await page.evaluate((duration) => window.__DONT_WAVE__.advance(duration), milliseconds);
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+  return state;
 }
 
-async function aimAndActivateVisibleWaver(page: Page, activation: "mouse" | "touch" = "mouse"): Promise<void> {
-  const canvas = page.locator("canvas");
-  const bounds = await canvas.boundingBox();
-  if (!bounds) throw new Error("Canvas has no clickable bounds.");
-  const reticle = page.locator("[data-ui='reticle']");
-  for (let yStep = 3; yStep <= 17; yStep += 1) {
-    for (let xStep = 2; xStep <= 18; xStep += 1) {
-      const x = bounds.x + bounds.width * (xStep / 20);
-      const y = bounds.y + bounds.height * (yStep / 20);
-      await page.mouse.move(x, y);
-      if (await reticle.getAttribute("data-can-zap") === "true") {
-        const before = await page.evaluate(() => window.__DONT_WAVE__.state().playerHits);
-        if (activation === "touch") await page.touchscreen.tap(x, y);
-        else await page.mouse.click(x, y);
-        await expect(page.locator(".dw-shell")).toHaveClass(/is-hit/);
-        await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerHits)).toBe(before + 1);
-        return;
-      }
+async function capture(page: Page, filename: string): Promise<void> {
+  await mkdir(SCREENSHOTS, { recursive: true });
+  await page.screenshot({ path: resolve(SCREENSHOTS, filename), fullPage: true, animations: "disabled" });
+}
+
+async function enterHunt(page: Page, touch = false): Promise<void> {
+  const start = page.getByTestId("start");
+  if (await start.isVisible()) touch ? await start.tap() : await start.click();
+  const green = page.getByTestId("green");
+  touch ? await green.tap() : await green.click();
+  await advance(page, 4_500);
+  const red = page.getByTestId("red");
+  await expect(red).toBeEnabled();
+  touch ? await red.tap() : await red.click();
+  await advance(page, 500);
+  await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("hunt");
+}
+
+async function clickProjected(page: Page, pose: "waving" | "still", touch = false): Promise<string> {
+  const projection = await page.evaluate((wantedPose) => {
+    const state = window.__DONT_WAVE__.state();
+    for (const contestant of state.contestants) {
+      if (contestant.status !== "active" || contestant.pose !== wantedPose) continue;
+      const projected = window.__DONT_WAVE__.projectContestant(contestant.id);
+      if (projected?.visible) return projected;
+    }
+    return null;
+  }, pose);
+  if (!projection) throw new Error(`No visible ${pose} contestant could be projected.`);
+  if (touch) await page.touchscreen.tap(projection.x, projection.y);
+  else await page.mouse.click(projection.x, projection.y);
+  return projection.id;
+}
+
+async function finishEightTurns(page: Page, touch = false): Promise<void> {
+  for (let absoluteTurn = 0; absoluteTurn < 8; absoluteTurn += 1) {
+    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("ready");
+    const green = page.getByTestId("green");
+    touch ? await green.tap() : await green.click();
+    await advance(page, 4_500);
+    const red = page.getByTestId("red");
+    touch ? await red.tap() : await red.click();
+    await advance(page, 500 + 5_000 + 3_200);
+    if (absoluteTurn === 3) {
+      await expect(page.getByTestId("round-break")).toBeVisible();
+      const nextRound = page.getByTestId("continue-round");
+      touch ? await nextRound.tap() : await nextRound.click();
     }
   }
-  throw new Error("Could not aim at any rendered waving target.");
 }
 
-async function activateControl(page: Page, testId: string, touch: boolean): Promise<void> {
-  const control = page.getByTestId(testId);
-  await expect(control).toBeVisible();
-  await expect(control).toBeEnabled();
-  if (touch) await control.tap();
-  else await control.click();
-}
+test.describe("desktop reset", () => {
+  test.beforeEach(async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== "desktop-chromium", "Desktop primary gate.");
+    await boot(page);
+  });
 
-async function useCrossingControl(page: Page, touch: boolean): Promise<void> {
-  const move = page.getByTestId("move");
-  await expect(move).toBeVisible();
-  await expect(move).toBeEnabled();
+  test("shows forward motion, a fixed camera, real target penalties, and the five-second lead", async ({ page }) => {
+    await page.getByTestId("start").click();
+    await page.getByTestId("green").click();
+    const before = await page.evaluate(() => ({
+      camera: window.__DONT_WAVE__.cameraSnapshot(),
+      z: window.__DONT_WAVE__.state().contestants.map((contestant) => contestant.z),
+    }));
+    await advance(page, 1_000);
+    const after = await page.evaluate(() => ({
+      camera: window.__DONT_WAVE__.cameraSnapshot(),
+      z: window.__DONT_WAVE__.state().contestants.map((contestant) => contestant.z),
+    }));
+    expect(after.z.every((z, index) => z > (before.z[index] ?? Number.POSITIVE_INFINITY))).toBe(true);
+    expect(after.camera).toEqual(before.camera);
+    const canvas = page.locator("canvas");
+    const bounds = await canvas.boundingBox();
+    if (!bounds) throw new Error("Canvas has no bounds.");
+    await page.mouse.move(bounds.x + bounds.width * 0.8, bounds.y + bounds.height * 0.45);
+    expect(await page.evaluate(() => window.__DONT_WAVE__.cameraSnapshot())).toEqual(before.camera);
+    await capture(page, "01-forward-green.png");
 
-  if (!touch) {
+    await advance(page, 3_500);
+    await page.getByTestId("red").click();
+    await expect(page.locator("[data-ui='announcement']")).toHaveText("RED LIGHT");
+    await advance(page, 500);
+    await capture(page, "02-red-wave-still.png");
+
+    const reticle = page.locator("[data-ui='reticle']");
+    const reticleXBefore = await page.locator(".dw-shell").evaluate((element) => (
+      getComputedStyle(element).getPropertyValue("--reticle-x")
+    ));
+    await canvas.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(reticle).toBeVisible();
+    const reticleXAfter = await page.locator(".dw-shell").evaluate((element) => (
+      getComputedStyle(element).getPropertyValue("--reticle-x")
+    ));
+    expect(reticleXAfter).not.toBe(reticleXBefore);
+
+    const correctId = await clickProjected(page, "waving");
+    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerScore)).toBe(100);
+    expect(await page.evaluate((id) => window.__DONT_WAVE__.state().contestants.find((c) => c.id === id)?.status, correctId)).toBe("evaporated");
+    const wrongId = await clickProjected(page, "still");
+    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerScore)).toBe(0);
+    expect(await page.evaluate((id) => window.__DONT_WAVE__.state().contestants.find((c) => c.id === id)?.status, wrongId)).toBe("evaporated");
+
+    await advance(page, 4_999);
+    expect(await page.evaluate(() => {
+      const state = window.__DONT_WAVE__.state();
+      return [state.phase, state.leftScore, state.rightScore];
+    })).toEqual(["hunt", 0, 0]);
+    await advance(page, 1);
+    expect(await page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("rivals");
+    await advance(page, 350);
+    expect(await page.evaluate(() => {
+      const state = window.__DONT_WAVE__.state();
+      return state.leftScore + state.rightScore;
+    })).toBeGreaterThan(0);
+    await capture(page, "03-rival-volley.png");
+  });
+
+  test("completes two rounds, refreshes the crowd, and performs the fixed death ending", async ({ page }) => {
+    await page.getByTestId("start").click();
+    const firstVisuals = await page.evaluate(() => window.__DONT_WAVE__.state().contestants.map((c) => c.visual));
+    await finishEightTurns(page);
+    await expect(page.getByTestId("final-standings")).toBeVisible();
+    const state = await page.evaluate(() => window.__DONT_WAVE__.state());
+    expect(state.history).toHaveLength(8);
+    expect(state.crowdRevision).toBe(2);
+    expect(state.contestants.map((contestant) => contestant.visual)).not.toEqual(firstVisuals);
+    await page.getByTestId("leave-tower").click();
+    await advance(page, 2_200);
+    expect((await page.evaluate(() => window.__DONT_WAVE__.cameraSnapshot())).screenUp[1]).toBeGreaterThan(0.9);
+    await page.getByTestId("begin-crossing").click();
     await page.locator(".dw-shell").focus();
     await page.keyboard.down("KeyW");
-    await page.keyboard.down("Space");
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerMoving)).toBe(true);
-    await page.keyboard.up("KeyW");
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerMoving)).toBe(true);
     await advance(page, 1_400);
-    await page.keyboard.up("Space");
-  } else {
-    const bounds = await move.boundingBox();
-    if (!bounds) throw new Error("Crossing control has no touchable bounds.");
-    const x = bounds.x + bounds.width / 2;
-    const y = bounds.y + bounds.height / 2;
-    const client = await page.context().newCDPSession(page);
-    try {
-      await client.send("Input.dispatchTouchEvent", {
-        type: "touchStart",
-        touchPoints: [{ x, y, id: 1, radiusX: 1, radiusY: 1, force: 1 }],
-      });
-      await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerMoving)).toBe(true);
-      await advance(page, 1_400);
-    } finally {
-      try {
-        await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-      } finally {
-        await client.detach();
-      }
-    }
-  }
-
-  await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerMoving)).toBe(false);
-  await advance(page, 3_100);
-}
-
-async function driveToComplete(page: Page, touch = false): Promise<DontWaveState> {
-  for (let guard = 0; guard < 80; guard += 1) {
-    const state = await page.evaluate(() => window.__DONT_WAVE__.state());
-    if (state.phase === "complete") return state;
-    if (state.paused) {
-      await activateControl(page, "resume", touch);
-      continue;
-    }
-    switch (state.phase) {
-      case "briefing":
-        await activateControl(page, "start", touch);
-        break;
-      case "ready":
-        await activateControl(page, "green", touch);
-        await advance(page, 700);
-        await activateControl(page, "red", touch);
-        break;
-      case "reveal":
-        await advance(page, 650);
-        break;
-      case "hunt":
-        await advance(page, 5_200);
-        break;
-      case "report":
-        await activateControl(page, "continue-report", touch);
-        break;
-      case "descent":
-        await advance(page, 3_000);
-        break;
-      case "crossing-ready":
-        await activateControl(page, "begin-crossing", touch);
-        break;
-      case "crossing-green":
-        await useCrossingControl(page, touch);
-        break;
-      case "crossing-red":
-        await advance(page, 900);
-        break;
-      case "death":
-        await advance(page, 1_200);
-        break;
-    }
-  }
-  const stopped = await page.evaluate(() => window.__DONT_WAVE__.state().phase);
-  throw new Error(`Journey did not complete; stopped at ${stopped}.`);
-}
-
-test.describe("desktop watchtower journey", () => {
-  test.beforeEach(async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name !== "desktop-chromium", "Desktop-only journey.");
-    await boot(page);
+    await page.keyboard.up("KeyW");
+    await advance(page, 2_600);
+    expect(await page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("crossing-red");
+    await advance(page, 650);
+    expect((await page.evaluate(() => window.__DONT_WAVE__.cameraSnapshot())).handVisible).toBe(true);
+    await capture(page, "04-involuntary-wave.png");
+    await advance(page, 450 + 1_400);
+    await expect(page.getByTestId("complete")).toBeVisible();
+    await expect(page.getByTestId("restart")).toHaveText("PLAY AGAIN");
   });
 
-  test("ordinary controls complete the target race and compulsory ending", async ({ page }) => {
+  test("uses a static fall and fade when reduced motion is requested", async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
     await page.getByTestId("start").click();
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("ready");
-    await capture(page, "desktop-ready-watchtower.png");
-
-    await page.keyboard.press("KeyG");
-    await expect(page.getByTestId("red")).toBeDisabled();
-    await advance(page, 700);
-    await expect(page.getByTestId("red")).toBeEnabled();
-    await page.keyboard.press("KeyR");
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("reveal");
-    await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("READ THE FIELD");
-    await capture(page, "desktop-red-reveal.png");
-
-    await advance(page, 650);
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().phase)).toBe("hunt");
-    await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("YOUR WINDOW");
-    await capture(page, "desktop-player-head-start.png");
-
-    const missesBefore = await page.evaluate(() => window.__DONT_WAVE__.state().playerMisses);
-    const canvas = await page.locator("canvas").boundingBox();
-    if (!canvas) throw new Error("Canvas has no bounds.");
-    await page.mouse.click(canvas.x + 12, canvas.y + canvas.height - 12);
-    await expect(page.locator(".dw-shell")).toHaveClass(/is-miss/);
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().playerMisses)).toBe(missesBefore + 1);
-    await aimAndActivateVisibleWaver(page);
-
-    await page.getByRole("button", { name: "Pause game" }).focus();
-    await page.keyboard.press("Space");
-    const paused = await page.evaluate(() => window.__DONT_WAVE__.state());
-    expect(paused.paused).toBe(true);
-    await expect(page.getByRole("dialog")).toBeVisible();
-    await page.waitForTimeout(180);
-    expect(await page.evaluate(() => window.__DONT_WAVE__.state().phaseElapsedMs)).toBe(paused.phaseElapsedMs);
-    await page.getByTestId("resume").focus();
-    await page.keyboard.press("Space");
-    await expect.poll(() => page.evaluate(() => window.__DONT_WAVE__.state().paused)).toBe(false);
-    const shotsBeforeResumeSpace = await page.evaluate(() => {
-      const state = window.__DONT_WAVE__.state();
-      return state.playerHits + state.playerMisses;
-    });
-    await page.keyboard.press("Space");
-    await expect.poll(() => page.evaluate(() => {
-      const state = window.__DONT_WAVE__.state();
-      return state.playerHits + state.playerMisses;
-    })).toBe(shotsBeforeResumeSpace + 1);
-    expect(await page.evaluate(() => window.__DONT_WAVE__.state().paused)).toBe(false);
-    await advance(page, 2_400);
-    await expect(page.locator("[data-ui='hunt-owner']")).toHaveText("SIDE TOWERS ACTIVE");
-    await capture(page, "desktop-side-operators-active.png");
-
-    const complete = await driveToComplete(page);
-    expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(4);
-    expect(new Set(complete.history.map((turn) => `${turn.address.round}:${turn.address.turn}`)).size).toBe(4);
-    expect(complete.playerProgress).toBeGreaterThan(0);
-    expect(complete.counts.survivors).toBeGreaterThan(0);
-    const sideScore = (complete.operatorHits * 100).toLocaleString("en-GB");
-    await expect(page.locator("[data-ui='operator-score']")).toHaveText(sideScore);
-    await expect(page.locator(".dw-stat").filter({ hasText: "Tower score" })).toContainText(sideScore);
-    await expect(page.getByRole("heading", { name: "THE TOWER CONTINUES." })).toBeVisible();
-    await capture(page, "desktop-compulsory-ending.png");
-    await page.getByTestId("restart").click();
-    await expect(page.getByTestId("briefing")).toBeVisible();
+    await finishEightTurns(page);
+    await page.getByTestId("leave-tower").click();
+    await advance(page, 2_200);
+    await page.getByTestId("begin-crossing").click();
+    await advance(page, CROSSING_GREEN_MS);
+    await advance(page, CROSSING_RED_MS);
+    await advance(page, DEATH_MS / 2);
+    const camera = await page.evaluate(() => window.__DONT_WAVE__.cameraSnapshot());
+    expect(camera.screenUp[1]).toBeGreaterThan(0.9);
   });
 });
 
-test.describe("mobile landscape touch journey", () => {
-  test.beforeEach(async ({ page }, testInfo) => {
+test.describe("responsive smoke", () => {
+  test("keeps the touch loop within a phone-landscape viewport", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== "pixel-7-landscape-chromium", "Landscape touch only.");
     await boot(page);
+    await enterHunt(page, true);
+    await clickProjected(page, "waving", true);
+    const layout = await page.evaluate(() => ({
+      width: innerWidth,
+      height: innerHeight,
+      scrollWidth: document.documentElement.scrollWidth,
+      scrollHeight: document.documentElement.scrollHeight,
+    }));
+    expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width);
+    expect(layout.scrollHeight).toBeLessThanOrEqual(layout.height);
+    await capture(page, "05-phone-landscape.png");
   });
 
-  test("touch controls remain usable through a complete run", async ({ page }) => {
-    const briefingLayout = await page.evaluate(() => {
-      const panel = document.querySelector<HTMLElement>(".dw-panel");
-      const start = document.querySelector<HTMLElement>("[data-testid='start']");
-      if (!panel || !start) throw new Error("Landscape briefing is missing.");
-      const panelBounds = panel.getBoundingClientRect();
-      const startBounds = start.getBoundingClientRect();
-      return {
-        viewportHeight: innerHeight,
-        panelTop: panelBounds.top,
-        panelBottom: panelBounds.bottom,
-        startTop: startBounds.top,
-        startBottom: startBounds.bottom,
-      };
-    });
-    expect(briefingLayout.panelTop).toBeGreaterThanOrEqual(-1);
-    expect(briefingLayout.panelBottom).toBeLessThanOrEqual(briefingLayout.viewportHeight + 1);
-    expect(briefingLayout.startTop).toBeGreaterThanOrEqual(-1);
-    expect(briefingLayout.startBottom).toBeLessThanOrEqual(briefingLayout.viewportHeight + 1);
-
-    await page.getByTestId("start").tap();
-    await page.getByTestId("green").tap();
-    await advance(page, 700);
-    await page.getByTestId("red").tap();
-    await advance(page, 650);
-
-    await aimAndActivateVisibleWaver(page, "touch");
-    await capture(page, "mobile-landscape-hunt.png");
-
-    const layout = await page.evaluate(() => {
-      const controls = [...document.querySelectorAll<HTMLElement>("button:not([hidden])")].map((button) => {
-        const box = button.getBoundingClientRect();
-        return { width: box.width, height: box.height, left: box.left, right: box.right, top: box.top, bottom: box.bottom };
-      });
-      return {
-        viewport: { width: innerWidth, height: innerHeight },
-        scroll: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight },
-        controls,
-      };
-    });
-    expect(layout.scroll.width).toBeLessThanOrEqual(layout.viewport.width);
-    expect(layout.scroll.height).toBeLessThanOrEqual(layout.viewport.height);
-    for (const control of layout.controls) {
-      expect(control.width).toBeGreaterThanOrEqual(34);
-      expect(control.height).toBeGreaterThanOrEqual(34);
-      expect(control.left).toBeGreaterThanOrEqual(-1);
-      expect(control.right).toBeLessThanOrEqual(layout.viewport.width + 1);
-      expect(control.top).toBeGreaterThanOrEqual(-1);
-      expect(control.bottom).toBeLessThanOrEqual(layout.viewport.height + 1);
-    }
-
-    const complete = await driveToComplete(page, true);
-    expect(complete).toMatchObject({ phase: "complete", playerMoving: false });
-    expect(complete.history).toHaveLength(4);
-  });
-});
-
-test.describe("presentation and provenance smoke", () => {
-  test("reduced motion does not stall a hunt or the ending", async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name !== "desktop-chromium", "Single reduced-motion pass.");
-    await page.emulateMedia({ reducedMotion: "reduce" });
-    await boot(page);
-    const complete = await driveToComplete(page);
-    expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(4);
-  });
-
-  test("the UI makes no quantum claim and the complete run makes no external request", async ({ page }, testInfo) => {
+  test("keeps quantum claims and external requests out of the portrait build", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== "pixel-7-portrait-chromium", "Portrait smoke only.");
     const requests: string[] = [];
     page.on("request", (request) => requests.push(request.url()));
     await boot(page);
-    const bodyText = await page.locator("body").innerText();
-    expect(bodyText).not.toMatch(/QPU|quantum|particle|collapse|entangl|circuit/i);
-    expect(bodyText).not.toMatch(/prepared outcomes?|observation field/i);
-    await page.getByTestId("start").tap();
-    const orientationBounds = await page.locator(".dw-orientation-note").boundingBox();
-    const greenBounds = await page.getByTestId("green").boundingBox();
-    if (!orientationBounds || !greenBounds) throw new Error("Portrait controls are missing layout bounds.");
-    expect(greenBounds.height).toBeGreaterThanOrEqual(44);
-    expect(greenBounds.y + greenBounds.height).toBeLessThanOrEqual(orientationBounds.y);
-    await page.getByTestId("green").tap();
-    await advance(page, 700);
-    await page.getByTestId("red").tap();
-    const internal = await page.evaluate(() => window.__DONT_WAVE__.state().currentRecord);
-    expect(internal).toMatchObject({
-      schemaVersion: 3,
-      address: { round: 1, turn: 1 },
-      provenance: {
-        kind: "classical-demo",
-        modelId: "dw-prepared-turn-v3",
-        preparedBeforePlay: true,
-      },
-    });
-    const complete = await driveToComplete(page, true);
-    expect(complete.phase).toBe("complete");
-    expect(complete.history).toHaveLength(4);
+    expect(await page.locator("body").innerText()).not.toMatch(/QPU|quantum|particle|collapse|entangl|circuit/i);
+    await expect(page.locator(".dw-orientation")).toBeVisible();
     const origin = new URL(page.url()).origin;
     expect(requests.every((url) => new URL(url).origin === origin)).toBe(true);
-    await expect(page.locator(".dw-orientation-note")).toBeVisible();
   });
 });

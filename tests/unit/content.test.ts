@@ -1,48 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { createCreatureDefinitions, DEFAULT_POPULATION_SIZE } from "../../src/content/creatures";
+import { createContestantDefinitions } from "../../src/content/creatures";
+import {
+  CONTESTANT_COUNT,
+  FIELD_COLUMNS,
+  FIELD_ROWS,
+  FINISH_Z,
+  distanceToFinish,
+  fieldSlot,
+} from "../../src/content/fieldLayout";
 
-describe("creature content", () => {
-  it("creates 48 stable, unique identities with cosmetic variation only", () => {
-    const first = createCreatureDefinitions(7_071);
-    const second = createCreatureDefinitions(7_071);
-
-    expect(first).toEqual(second);
-    expect(first).toHaveLength(DEFAULT_POPULATION_SIZE);
-    expect(new Set(first.map((creature) => creature.id)).size).toBe(DEFAULT_POPULATION_SIZE);
-    expect(new Set(first.map((creature) => creature.name)).size).toBe(DEFAULT_POPULATION_SIZE);
-    expect(new Set(first.map((creature) => JSON.stringify(creature.visual))).size).toBe(DEFAULT_POPULATION_SIZE);
-    expect(first.every((creature) => Object.keys(creature).sort().join(",") === "id,name,visual")).toBe(true);
+describe("the reset field", () => {
+  it("places a six-by-six crowd entirely behind the tower-side finish", () => {
+    expect(CONTESTANT_COUNT).toBe(36);
+    expect(FIELD_COLUMNS * FIELD_ROWS).toBe(CONTESTANT_COUNT);
+    const slots = Array.from({ length: CONTESTANT_COUNT }, (_, index) => fieldSlot(index));
+    expect(slots.every((slot) => slot.startZ < FINISH_Z)).toBe(true);
+    expect(slots[0]?.startZ).toBeGreaterThan(slots.at(-1)?.startZ ?? 0);
   });
 
-  it("has no cohort, group, type, class, speed, hitbox, probability, or eligibility field", () => {
-    const creatures = createCreatureDefinitions(31);
-    const serialized = JSON.stringify(creatures);
-
-    for (const forbidden of [
-      "cohort",
-      "relationshipGroup",
-      "creatureType",
-      "creatureClass",
-      "movementRate",
-      "hitbox",
-      "probability",
-      "eligibility",
-    ]) {
-      expect(serialized).not.toContain(forbidden);
-    }
+  it("defines forward progress as increasing z and decreasing finish distance", () => {
+    const start = fieldSlot(CONTESTANT_COUNT - 1).startZ;
+    const later = start + 2;
+    expect(later).toBeGreaterThan(start);
+    expect(distanceToFinish(later)).toBeLessThan(distanceToFinish(start));
   });
 
-  it("keeps identity labels stable while seeded visual traits vary", () => {
-    const first = createCreatureDefinitions(12);
-    const second = createCreatureDefinitions(13);
-
-    expect(second.map(({ id, name }) => ({ id, name }))).toEqual(first.map(({ id, name }) => ({ id, name })));
-    expect(second.map((creature) => creature.visual)).not.toEqual(first.map((creature) => creature.visual));
-  });
-
-  it("rejects empty, fractional, and oversized populations", () => {
-    expect(() => createCreatureDefinitions(1, 0)).toThrow("integer");
-    expect(() => createCreatureDefinitions(1, 1.5)).toThrow("integer");
-    expect(() => createCreatureDefinitions(1, DEFAULT_POPULATION_SIZE + 1)).toThrow("integer");
+  it("keeps round populations mechanically aligned while refreshing their grotesque visuals", () => {
+    const first = createContestantDefinitions(7071, 1);
+    const second = createContestantDefinitions(7071, 2);
+    expect(first).toHaveLength(CONTESTANT_COUNT);
+    expect(new Set(first.map((contestant) => contestant.id)).size).toBe(CONTESTANT_COUNT);
+    expect(second.map(({ id, x, startZ }) => ({ id, x, startZ }))).not.toEqual(
+      first.map(({ id, x, startZ }) => ({ id, x, startZ })),
+    );
+    expect(second.map((contestant) => contestant.startZ)).toEqual(first.map((contestant) => contestant.startZ));
+    expect(second.map((contestant) => contestant.visual)).not.toEqual(first.map((contestant) => contestant.visual));
   });
 });

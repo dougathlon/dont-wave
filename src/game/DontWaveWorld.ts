@@ -13,33 +13,22 @@ import {
   WebGLRenderer,
 } from "three";
 import type { DontWaveSession } from "../simulation/DontWaveSession";
-import type { CreatureRuntimeState, DontWaveState, ZapCreatureResult } from "../simulation/types";
-import { CameraDirector } from "./CameraDirector";
-import {
-  MAX_FRAME_DELTA_MS,
-  MAX_PIXEL_RATIO,
-  OPERATOR_COLORS,
-  PALETTE,
-  stableHash,
-} from "./constants";
-import { CreatureField, type ZapPresentation } from "./creatures/CreatureField";
+import type { ContestantState, DontWaveState, FireResult, ShotEvent } from "../simulation/types";
+import { CameraDirector, type CameraSnapshot } from "./CameraDirector";
+import { MAX_FRAME_DELTA_MS, MAX_PIXEL_RATIO, OPERATOR_COLORS, PALETTE } from "./constants";
+import { CreatureField } from "./creatures/CreatureField";
 import { BeamPool } from "./fx/BeamPool";
+import { VaporPool } from "./fx/VaporPool";
 import { CivicPlayground } from "./world/CivicPlayground";
-import { Watchtower } from "./world/Watchtower";
+import { RivalTowers } from "./world/Watchtower";
 
-export const CREATURE_FOCUS_EVENT = "dont-wave:creature-focus";
 export const RETICLE_EVENT = "dont-wave:reticle";
 export const RENDER_STATUS_EVENT = "dont-wave:render-status";
-
-export interface CreatureFocusDetail {
-  readonly creatureId: string | null;
-}
+export const DRY_FIRE_EVENT = "dont-wave:dry-fire";
 
 export interface ReticleDetail {
-  readonly creatureId: string | null;
-  readonly canZap: boolean;
-  readonly normalizedX: number;
-  readonly normalizedY: number;
+  readonly x: number;
+  readonly y: number;
   readonly visible: boolean;
 }
 
@@ -48,116 +37,148 @@ export interface RenderStatusDetail {
   readonly message: string;
 }
 
-interface WorldSession {
-  getState(): DontWaveState;
-  subscribe(subscriber: (state: DontWaveState) => void): () => void;
-  tick(deltaMs: number): void;
-  zapCreature(creatureId: string): ZapCreatureResult;
-  registerMiss(): boolean;
+export interface ContestantProjection {
+  readonly id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly visible: boolean;
+  readonly pose: ContestantState["pose"];
+  readonly status: ContestantState["status"];
 }
 
 interface RayTarget {
-  readonly creatureId: string | null;
+  readonly contestantId: string | null;
   readonly point: Vector3;
 }
 
-/**
- * Disposable Three.js rendering adapter. It advances the session clock, but it
- * never computes target state, scores, wave outcomes, or phase transitions.
- */
+export interface DontWaveWorldOptions {
+  readonly autoTick?: boolean;
+}
+
+/** Fixed-camera Three.js adapter. It never owns movement, outcomes, ammunition, or score. */
 export class DontWaveWorld {
   readonly renderer: WebGLRenderer;
   private readonly scene = new Scene();
-  private readonly session: WorldSession;
-  private readonly cameraDirector: CameraDirector;
+  private readonly cameraDirector = new CameraDirector();
   private readonly playground = new CivicPlayground();
-  private readonly watchtower = new Watchtower();
-  private readonly beams = new BeamPool();
+  private readonly towers = new RivalTowers();
+  private readonly beams = new BeamPool(28);
+  private readonly vapor = new VaporPool(24);
   private readonly raycaster = new Raycaster();
   private readonly reticleNdc = new Vector2();
-  private readonly resizeObserver: ResizeObserver | null;
+  private readonly scratch = new Vector3();
   private readonly mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+  private readonly resizeObserver: ResizeObserver | null;
   private creatureField: CreatureField;
   private state: DontWaveState;
-  private unsubscribe: () => void;
+  private readonly unsubscribe: () => void;
+  private populationSignature: string;
   private animationFrame = 0;
   private lastFrameAt = 0;
   private elapsedMs = 0;
+  private presentedEventId = 0;
+  private lastPhase: DontWaveState["phase"] | "" = "";
   private reducedMotion = this.mediaQuery.matches;
-  private pointerActive = true;
   private pointerInside = false;
+  private pointerActive = false;
   private contextAvailable = true;
   private destroyed = false;
-  private focusedCreatureId: string | null = null;
-  private lastReticleKey = "";
-  private lastPhase = "";
-  private populationSignature: string;
+  private readonly autoTick: boolean;
 
-  constructor(private readonly parent: HTMLElement, session: DontWaveSession) {
-    if (!(parent instanceof HTMLElement)) throw new Error("Don't Wave requires a valid canvas parent.");
-    this.session = session as unknown as WorldSession;
-    this.state = this.session.getState();
-    this.populationSignature = populationSignature(this.state.creatures);
-    this.creatureField = new CreatureField(this.state.creatures);
-    this.cameraDirector = new CameraDirector(this.reducedMotion);
+  constructor(
+    private readonly parent: HTMLElement,
+    private readonly session: DontWaveSession,
+    options: DontWaveWorldOptions = {},
+  ) {
+    if (!(parent instanceof HTMLElement)) throw new Error("Don't Wave requires a valid render parent.");
+    this.autoTick = options.autoTick ?? true;
+    this.state = session.getState();
+    this.populationSignature = signature(this.state);
+    this.creatureField = new CreatureField(this.state.contestants);
 
-    this.scene.name = "dont-wave-world";
-    this.scene.background = PALETTE.abyss;
-    this.scene.fog = new Fog(PALETTE.abyss, 28, 78);
-    this.scene.add(this.cameraDirector.camera, this.playground, this.watchtower, this.creatureField, this.beams);
+    this.scene.name = "dont-wave-reset-world";
+    this.scene.background = PALETTE.sky;
+    this.scene.fog = new Fog(PALETTE.fog, 34, 78);
+    this.scene.add(
+      this.cameraDirector.camera,
+      this.playground,
+      this.towers,
+      this.creatureField,
+      this.beams,
+      this.vapor,
+    );
     this.addLights();
 
     this.renderer = new WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
     this.renderer.outputColorSpace = SRGBColorSpace;
     this.renderer.toneMapping = ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
-    this.renderer.setClearColor(PALETTE.abyss, 1);
+    this.renderer.toneMappingExposure = 1.03;
+    this.renderer.setClearColor(PALETTE.sky, 1);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
     this.renderer.domElement.className = "dont-wave-canvas";
-    this.renderer.domElement.setAttribute("aria-label", "Don't Wave watchtower view over the civic playground");
-    this.renderer.domElement.setAttribute("role", "img");
+    this.renderer.domElement.setAttribute("aria-label", "Fixed watchtower view of grotesque humanoids crossing toward the tower");
+    this.renderer.domElement.setAttribute("role", "application");
+    this.renderer.domElement.tabIndex = 0;
     this.renderer.domElement.style.width = "100%";
     this.renderer.domElement.style.height = "100%";
     this.renderer.domElement.style.display = "block";
     this.renderer.domElement.style.touchAction = "none";
     this.parent.append(this.renderer.domElement);
 
-    this.unsubscribe = this.session.subscribe((state) => {
+    this.unsubscribe = session.subscribe((state) => {
       this.state = state;
-      this.ensurePopulation(state.creatures);
+      this.ensurePopulation();
+      if (state.events.length === 0) this.presentedEventId = 0;
     });
-    this.resizeObserver = typeof ResizeObserver === "undefined"
-      ? null
-      : new ResizeObserver(() => this.resize());
-    this.resizeObserver?.observe(this.parent);
+    this.resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => this.resize());
+    this.resizeObserver?.observe(parent);
     this.bindEvents();
     this.resize();
     this.animationFrame = requestAnimationFrame(this.frame);
   }
 
-  /** Fires once through the same current camera/reticle ray shown to the player. */
-  fireAtReticle(): boolean {
-    if (!this.pointerActive || this.destroyed || !this.contextAvailable) return false;
-    return this.fireAt(this.reticleNdc);
-  }
-
   setPointerActive(active: boolean): void {
     this.pointerActive = active;
-    this.cameraDirector.setPointerActive(active);
     if (!active) {
       this.pointerInside = false;
-      this.publishReticle(null, false, false);
+      this.publishReticle(false);
     }
   }
 
-  focusCreature(creatureId: string | null): void {
-    const normalized = creatureId !== null && this.creatureField.creatureAt(creatureId) ? creatureId : null;
-    if (normalized === this.focusedCreatureId) return;
-    this.focusedCreatureId = normalized;
-    this.creatureField.setFocused(normalized);
-    window.dispatchEvent(new CustomEvent<CreatureFocusDetail>(CREATURE_FOCUS_EVENT, {
-      detail: { creatureId: normalized },
-    }));
+  fireAtReticle(): boolean {
+    if (!this.pointerActive || !this.contextAvailable || this.destroyed) return false;
+    return this.fireAt(this.reticleNdc);
+  }
+
+  nudgeReticle(deltaX: number, deltaY: number): void {
+    if (!this.pointerActive || this.destroyed) return;
+    this.pointerInside = true;
+    this.reticleNdc.set(
+      MathUtils.clamp(this.reticleNdc.x + deltaX, -0.96, 0.96),
+      MathUtils.clamp(this.reticleNdc.y + deltaY, -0.96, 0.96),
+    );
+    this.publishReticle(true);
+  }
+
+  projectContestant(id: string): ContestantProjection | null {
+    const contestant = this.state.contestants.find((candidate) => candidate.id === id);
+    const center = this.creatureField.centerFor(id, this.scratch);
+    if (!contestant || !center) return null;
+    const bounds = this.renderer.domElement.getBoundingClientRect();
+    const projected = center.clone().project(this.cameraDirector.camera);
+    const onScreen = projected.z >= -1 && projected.z <= 1 && Math.abs(projected.x) <= 1 && Math.abs(projected.y) <= 1;
+    return {
+      id,
+      x: bounds.left + (projected.x + 1) * 0.5 * bounds.width,
+      y: bounds.top + (1 - (projected.y + 1) * 0.5) * bounds.height,
+      visible: contestant.status === "active" && onScreen,
+      pose: contestant.pose,
+      status: contestant.status,
+    };
+  }
+
+  cameraSnapshot(): CameraSnapshot {
+    return this.cameraDirector.snapshot();
   }
 
   destroy(): void {
@@ -167,11 +188,12 @@ export class DontWaveWorld {
     this.unsubscribe();
     this.resizeObserver?.disconnect();
     this.unbindEvents();
-    this.cameraDirector.dispose();
     this.creatureField.dispose();
+    this.cameraDirector.dispose();
     this.playground.dispose();
-    this.watchtower.dispose();
+    this.towers.dispose();
     this.beams.dispose();
+    this.vapor.dispose();
     this.scene.clear();
     this.renderer.dispose();
     this.renderer.forceContextLoss();
@@ -185,21 +207,16 @@ export class DontWaveWorld {
       this.lastFrameAt = 0;
       return;
     }
-
-    const deltaMs = this.lastFrameAt === 0
-      ? 0
-      : Math.min(MAX_FRAME_DELTA_MS, Math.max(0, now - this.lastFrameAt));
+    const deltaMs = this.lastFrameAt === 0 ? 0 : Math.min(MAX_FRAME_DELTA_MS, Math.max(0, now - this.lastFrameAt));
     this.lastFrameAt = now;
-    if (deltaMs > 0) this.session.tick(deltaMs);
-    const presentationDeltaMs = this.state.paused ? 0 : deltaMs;
-    this.elapsedMs += presentationDeltaMs;
-
-    this.cameraDirector.update(this.state, presentationDeltaMs);
-    const zaps = this.creatureField.sync(this.state.creatures, this.elapsedMs, this.reducedMotion);
-    this.presentZaps(zaps);
+    if (deltaMs > 0 && this.autoTick) this.session.tick(deltaMs);
+    this.elapsedMs += deltaMs;
+    this.cameraDirector.update(this.state, this.elapsedMs, this.reducedMotion);
+    this.creatureField.sync(this.state.contestants, this.elapsedMs, this.reducedMotion);
+    this.presentEvents();
     this.presentPhaseTransition();
-    this.beams.update(presentationDeltaMs);
-    if (this.pointerInside && this.pointerActive) this.updateReticle();
+    this.beams.update(deltaMs);
+    this.vapor.update(deltaMs);
     this.renderer.render(this.scene, this.cameraDirector.camera);
   };
 
@@ -207,38 +224,35 @@ export class DontWaveWorld {
     if (!this.pointerActive) return;
     this.pointerInside = true;
     this.readPointer(event, this.reticleNdc);
-    this.cameraDirector.setPointer(this.reticleNdc.x, this.reticleNdc.y);
-    this.cameraDirector.setPointerActive(true);
-    this.updateReticle();
+    this.publishReticle(true);
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
     if (!this.pointerActive || !event.isPrimary || event.button !== 0) return;
     event.preventDefault();
+    this.renderer.domElement.focus({ preventScroll: true });
     this.pointerInside = true;
     this.readPointer(event, this.reticleNdc);
-    this.cameraDirector.setPointer(this.reticleNdc.x, this.reticleNdc.y);
-    if (this.state.phase !== "hunt" || this.state.paused || !this.contextAvailable) return;
+    this.publishReticle(true);
     this.fireAt(this.reticleNdc);
   };
 
   private readonly onPointerEnter = (): void => {
     if (!this.pointerActive) return;
     this.pointerInside = true;
-    this.cameraDirector.setPointerActive(true);
+    this.publishReticle(true);
   };
 
   private readonly onPointerLeave = (): void => {
     this.pointerInside = false;
-    this.cameraDirector.setPointerActive(false);
-    this.publishReticle(null, false, false);
+    this.publishReticle(false);
   };
 
   private readonly onContextLost = (event: Event): void => {
     event.preventDefault();
     this.contextAvailable = false;
     this.lastFrameAt = 0;
-    this.publishRenderStatus("lost", "WebGL context lost. The shift is held until rendering returns.");
+    this.publishStatus("lost", "WebGL context lost. The game clock is held.");
   };
 
   private readonly onContextRestored = (): void => {
@@ -246,7 +260,7 @@ export class DontWaveWorld {
     this.lastFrameAt = 0;
     this.renderer.resetState();
     this.resize();
-    this.publishRenderStatus("restored", "WebGL context restored. The shift may continue.");
+    this.publishStatus("restored", "WebGL context restored.");
   };
 
   private readonly onVisibilityChange = (): void => {
@@ -255,145 +269,121 @@ export class DontWaveWorld {
 
   private readonly onReducedMotionChange = (event: MediaQueryListEvent): void => {
     this.reducedMotion = event.matches;
-    this.cameraDirector.setReducedMotion(event.matches);
   };
 
-  private readonly onWindowResize = (): void => this.resize();
+  private readonly onResize = (): void => this.resize();
 
   private fireAt(ndc: Vector2): boolean {
-    if (this.state.phase !== "hunt" || this.state.paused) return false;
+    if (this.state.phase !== "hunt") return false;
     const target = this.resolveRayTarget(ndc);
-    const creature = creatureFromState(this.state, target.creatureId);
-    const valid = creature !== null && isLiveWavingTarget(creature, this.state);
-    if (valid && target.creatureId !== null) {
-      const accepted = this.session.zapCreature(target.creatureId);
-      this.focusCreature(target.creatureId);
-      return accepted.accepted;
+    const result = this.session.fire(target.contestantId);
+    if (!result.fired) {
+      if (result.reason === "no-ammo") window.dispatchEvent(new Event(DRY_FIRE_EVENT));
+      return false;
     }
-
-    this.session.registerMiss();
-    this.beams.fire(this.playerBeamOrigin(), target.point, OPERATOR_COLORS.miss, 0.055, 260);
-    this.focusCreature(target.creatureId);
-    return false;
+    if (result.event.outcome === "empty") {
+      this.beams.fire(this.playerBeamOrigin(), target.point, OPERATOR_COLORS.empty, 0.05, 210);
+    }
+    return result.event.outcome === "correct";
   }
 
   private resolveRayTarget(ndc: Vector2): RayTarget {
     this.raycaster.setFromCamera(ndc, this.cameraDirector.camera);
-    const creatureHit = this.raycaster.intersectObject(this.creatureField.pickTargets, false)[0];
-    if (creatureHit) {
+    const contestantHit = this.raycaster.intersectObjects([...this.creatureField.pickableTargets()], false)[0];
+    if (contestantHit) {
       return {
-        creatureId: this.creatureField.creatureIdForInstance(creatureHit.instanceId),
-        point: creatureHit.point.clone(),
+        contestantId: this.creatureField.contestantIdForObject(contestantHit.object),
+        point: contestantHit.point.clone(),
       };
     }
     const groundHit = this.raycaster.intersectObject(this.playground.pickSurface, false)[0];
-    if (groundHit) return { creatureId: null, point: groundHit.point.clone() };
+    if (groundHit) return { contestantId: null, point: groundHit.point.clone() };
     return {
-      creatureId: null,
-      point: this.raycaster.ray.origin.clone().addScaledVector(this.raycaster.ray.direction, 38),
+      contestantId: null,
+      point: this.raycaster.ray.origin.clone().addScaledVector(this.raycaster.ray.direction, 45),
     };
   }
 
-  private updateReticle(): void {
-    const target = this.resolveRayTarget(this.reticleNdc);
-    const creature = creatureFromState(this.state, target.creatureId);
-    const canZap = creature !== null && isLiveWavingTarget(creature, this.state);
-    this.publishReticle(target.creatureId, canZap, true);
-    if (target.creatureId !== this.focusedCreatureId) this.focusCreature(target.creatureId);
-  }
-
-  private publishReticle(creatureId: string | null, canZap: boolean, visible: boolean): void {
-    const detail: ReticleDetail = {
-      creatureId,
-      canZap,
-      normalizedX: this.reticleNdc.x,
-      normalizedY: this.reticleNdc.y,
-      visible,
-    };
-    const key = `${creatureId ?? ""}:${canZap ? 1 : 0}:${visible ? 1 : 0}:${detail.normalizedX.toFixed(3)}:${detail.normalizedY.toFixed(3)}`;
-    if (key === this.lastReticleKey) return;
-    this.lastReticleKey = key;
-    window.dispatchEvent(new CustomEvent<ReticleDetail>(RETICLE_EVENT, { detail }));
-  }
-
-  private presentZaps(zaps: readonly ZapPresentation[]): void {
-    for (const zap of zaps) {
-      const operator = operatorFor(zap.zappedBy, zap.creatureId);
-      const origin = operator === "player"
+  private presentEvents(): void {
+    for (const event of this.state.events) {
+      if (event.id <= this.presentedEventId) continue;
+      this.presentedEventId = event.id;
+      if (!event.targetId) continue;
+      const target = this.creatureField.centerFor(event.targetId, this.scratch);
+      if (!target) continue;
+      const origin = event.operator === "player"
         ? this.playerBeamOrigin()
-        : operator === "left"
-          ? this.watchtower.leftBeamOrigin
-          : this.watchtower.rightBeamOrigin;
-      const color = operator === "player"
-        ? OPERATOR_COLORS.player
-        : operator === "left"
-          ? OPERATOR_COLORS.left
-          : OPERATOR_COLORS.right;
-      this.beams.fire(origin, zap.position.clone().add(new Vector3(0, 1.05, 0)), color, 0.085, 450);
+        : event.operator === "left"
+          ? this.towers.leftBeamOrigin
+          : this.towers.rightBeamOrigin;
+      const color = eventColor(event);
+      const rivalShot = event.operator !== "player";
+      this.beams.fire(origin, target, color, rivalShot ? 0.12 : 0.08, rivalShot ? 650 : 360);
+      this.vapor.burst(target, color);
     }
   }
 
   private presentPhaseTransition(): void {
-    const phase = String(this.state.phase);
-    if (phase === this.lastPhase) return;
-    if (phase === "death") {
-      const target = this.cameraDirector.camera.position.clone().add(new Vector3(0, -0.25, -0.7));
-      const useLeft = (stableHash(String(this.state.seed)) & 1) === 0;
-      this.beams.fire(
-        useLeft ? this.watchtower.leftBeamOrigin : this.watchtower.rightBeamOrigin,
-        target,
-        useLeft ? OPERATOR_COLORS.left : OPERATOR_COLORS.right,
-        0.085,
-        450,
-      );
+    if (this.state.phase === this.lastPhase) return;
+    if (this.state.phase === "death") {
+      const origin = this.state.leftScore <= this.state.rightScore ? this.towers.leftBeamOrigin : this.towers.rightBeamOrigin;
+      const color = origin === this.towers.leftBeamOrigin ? OPERATOR_COLORS.left : OPERATOR_COLORS.right;
+      this.beams.fire(origin, this.cameraDirector.camera.position.clone(), color, 0.16, 800);
     }
-    this.lastPhase = phase;
+    this.lastPhase = this.state.phase;
   }
 
   private playerBeamOrigin(): Vector3 {
-    return this.cameraDirector.camera.localToWorld(new Vector3(0.46, -0.44, -0.72));
+    return this.cameraDirector.camera.localToWorld(new Vector3(0.42, -0.34, -0.68));
+  }
+
+  private publishReticle(visible: boolean): void {
+    window.dispatchEvent(new CustomEvent<ReticleDetail>(RETICLE_EVENT, {
+      detail: {
+        x: (this.reticleNdc.x + 1) * 0.5,
+        y: 1 - (this.reticleNdc.y + 1) * 0.5,
+        visible: visible && this.pointerInside && this.pointerActive,
+      },
+    }));
   }
 
   private readPointer(event: PointerEvent, target: Vector2): void {
     const bounds = this.renderer.domElement.getBoundingClientRect();
-    const width = Math.max(1, bounds.width);
-    const height = Math.max(1, bounds.height);
     target.set(
-      MathUtils.clamp((event.clientX - bounds.left) / width * 2 - 1, -1, 1),
-      MathUtils.clamp(-((event.clientY - bounds.top) / height) * 2 + 1, -1, 1),
+      MathUtils.clamp((event.clientX - bounds.left) / Math.max(1, bounds.width) * 2 - 1, -1, 1),
+      MathUtils.clamp(-((event.clientY - bounds.top) / Math.max(1, bounds.height) * 2 - 1), -1, 1),
     );
   }
 
   private resize(): void {
     if (this.destroyed) return;
     const bounds = this.parent.getBoundingClientRect();
-    const width = Math.max(1, Math.round(bounds.width || this.parent.clientWidth || window.innerWidth));
-    const height = Math.max(1, Math.round(bounds.height || this.parent.clientHeight || window.innerHeight));
+    const width = Math.max(1, Math.round(bounds.width || window.innerWidth));
+    const height = Math.max(1, Math.round(bounds.height || window.innerHeight));
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
     this.renderer.setSize(width, height, false);
     this.cameraDirector.setAspect(width / height);
   }
 
-  private ensurePopulation(creatures: readonly CreatureRuntimeState[]): void {
-    const signature = populationSignature(creatures);
-    if (signature === this.populationSignature) return;
+  private ensurePopulation(): void {
+    const nextSignature = signature(this.state);
+    if (nextSignature === this.populationSignature) return;
     this.scene.remove(this.creatureField);
     this.creatureField.dispose();
-    this.creatureField = new CreatureField(creatures);
+    this.creatureField = new CreatureField(this.state.contestants);
     this.scene.add(this.creatureField);
-    this.populationSignature = signature;
-    this.focusedCreatureId = null;
+    this.populationSignature = nextSignature;
   }
 
   private addLights(): void {
-    const hemisphere = new HemisphereLight(PALETTE.cream, PALETTE.abyss, 2.25);
-    hemisphere.position.set(0, 18, 2);
-    const key = new DirectionalLight(PALETTE.cream, 3.3);
-    key.position.set(-8, 18, 13);
-    const fill = new DirectionalLight(PALETTE.cyan, 1.15);
-    fill.position.set(14, 9, -9);
-    const ambient = new AmbientLight(PALETTE.cream, 1.8);
-    this.scene.add(hemisphere, key, fill, ambient);
+    const sky = new HemisphereLight(0xe3ece3, 0x574e43, 2.4);
+    sky.position.set(0, 20, 0);
+    const sun = new DirectionalLight(0xfff0cf, 3.1);
+    sun.position.set(-11, 22, 14);
+    const fill = new DirectionalLight(0x9fd5d0, 1.2);
+    fill.position.set(15, 10, -18);
+    const ambient = new AmbientLight(0xded1b5, 1.15);
+    this.scene.add(sky, sun, fill, ambient);
   }
 
   private bindEvents(): void {
@@ -405,7 +395,7 @@ export class DontWaveWorld {
     canvas.addEventListener("webglcontextlost", this.onContextLost);
     canvas.addEventListener("webglcontextrestored", this.onContextRestored);
     document.addEventListener("visibilitychange", this.onVisibilityChange);
-    window.addEventListener("resize", this.onWindowResize);
+    window.addEventListener("resize", this.onResize);
     this.mediaQuery.addEventListener("change", this.onReducedMotionChange);
   }
 
@@ -418,44 +408,27 @@ export class DontWaveWorld {
     canvas.removeEventListener("webglcontextlost", this.onContextLost);
     canvas.removeEventListener("webglcontextrestored", this.onContextRestored);
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
-    window.removeEventListener("resize", this.onWindowResize);
+    window.removeEventListener("resize", this.onResize);
     this.mediaQuery.removeEventListener("change", this.onReducedMotionChange);
   }
 
-  private publishRenderStatus(status: RenderStatusDetail["status"], message: string): void {
-    window.dispatchEvent(new CustomEvent<RenderStatusDetail>(RENDER_STATUS_EVENT, {
-      detail: { status, message },
-    }));
+  private publishStatus(status: RenderStatusDetail["status"], message: string): void {
+    window.dispatchEvent(new CustomEvent<RenderStatusDetail>(RENDER_STATUS_EVENT, { detail: { status, message } }));
   }
 }
 
-function isLiveWavingTarget(creature: CreatureRuntimeState, state: DontWaveState): boolean {
-  const renderCreature = creature as CreatureRuntimeState & { readonly zappedBy?: unknown };
-  return state.phase === "hunt"
-    && !state.paused
-    && String(creature.pose) === "waving"
-    && (renderCreature.zappedBy === null || renderCreature.zappedBy === undefined)
-    && !isResolvedStatus(creature.status);
+function eventColor(event: ShotEvent): number {
+  if (event.operator === "left") return OPERATOR_COLORS.left;
+  if (event.operator === "right") return OPERATOR_COLORS.right;
+  return event.outcome === "wrong" ? OPERATOR_COLORS.wrong : OPERATOR_COLORS.player;
 }
 
-function isResolvedStatus(status: CreatureRuntimeState["status"]): boolean {
-  const value = String(status);
-  return value === "zapped" || value === "removed" || value === "dead" || value === "crossed" || value === "sheltered";
+function signature(state: DontWaveState): string {
+  return `${state.seed}:${state.crowdRevision}:${state.contestants.map((contestant) => (
+    `${contestant.id}:${contestant.x}:${contestant.startZ}:${JSON.stringify(contestant.visual)}`
+  )).join("|")}`;
 }
 
-function operatorFor(zappedBy: string, creatureId: string): "player" | "left" | "right" {
-  const normalized = zappedBy.toLowerCase();
-  if (normalized.includes("player") || normalized.includes("observer")) return "player";
-  if (normalized.includes("left")) return "left";
-  if (normalized.includes("right")) return "right";
-  return (stableHash(`${zappedBy}:${creatureId}`) & 1) === 0 ? "left" : "right";
-}
-
-function populationSignature(creatures: readonly CreatureRuntimeState[]): string {
-  return creatures.map((creature) => `${creature.id}:${JSON.stringify(creature.visual)}`).join("|");
-}
-
-function creatureFromState(state: DontWaveState, creatureId: string | null): CreatureRuntimeState | null {
-  if (creatureId === null) return null;
-  return state.creatures.find((creature) => creature.id === creatureId) ?? null;
+export function wasFired(result: FireResult): result is Extract<FireResult, { fired: true }> {
+  return result.fired;
 }

@@ -1,72 +1,76 @@
-import { createCreatureDefinitions } from "../content/creatures";
-import { CREATURE_CROSSING_MS, creatureStartingProgress } from "../content/fieldLayout";
+import { createContestantDefinitions } from "../content/creatures";
+import { FINISH_Z } from "../content/fieldLayout";
 import {
   ClassicalDemoTurnBank,
   TOTAL_ROUNDS,
   TURN_RECORD_MODEL_ID,
   TURN_RECORD_SCHEMA_VERSION,
   TURNS_PER_ROUND,
+  WAVERS_PER_TURN,
   turnAddressKey,
   validateTurnRecord,
 } from "./observationBank";
 import { mixSeed, normalizeSeed } from "./rng";
 import type {
-  CreatureDefinition,
-  CreatureRuntimeState,
+  ContestantDefinition,
+  ContestantState,
   DontWavePhase,
   DontWaveState,
+  FireResult,
   OperatorId,
   PopulationCounts,
-  SideOperatorId,
+  RivalId,
+  ShotEvent,
+  ShotOutcome,
   TurnBank,
   TurnRecord,
   TurnSummary,
-  ZapCreatureResult,
-  ZapEvent,
 } from "./types";
 
-export const MIN_RED_TRIGGER_MS = 700;
+export const CHARGE_STEP_MS = 750;
+export const MAX_AMMO = 6;
 export const MAX_GREEN_MS = 5_500;
-export const REVEAL_MS = 650;
-export const HUNT_MS = 5_200;
-export const SIDE_OPERATOR_INTERVAL_MS = 700;
-export const DESCENT_MS = 3_000;
-export const CROSSING_GREEN_MS = 4_500;
-export const CROSSING_RED_MS = 900;
-export const DEATH_MS = 1_200;
-export const CORRECT_HIT_SCORE = 100;
+export const REVEAL_MS = 500;
+export const HUNT_MS = 5_000;
+export const RIVAL_FIRST_SHOT_MS = 350;
+export const RIVAL_SHOT_INTERVAL_MS = 550;
+export const RIVAL_SETTLE_MS = 450;
+export const INTERTURN_MS = 650;
+export const DESCENT_MS = 2_200;
+export const CROSSING_GREEN_MS = 4_000;
+export const CROSSING_RED_MS = 1_100;
+export const DEATH_MS = 1_400;
+export const CORRECT_SCORE = 100;
+export const WRONG_SCORE = -100;
 
-const SIDE_OPERATOR_STARTS_MS = [2_400, 1_800, 1_500, 1_200] as const;
-
-export function sideOperatorStartMs(round: number, turn: number): number {
-  const index = (round - 1) * TURNS_PER_ROUND + (turn - 1);
-  return SIDE_OPERATOR_STARTS_MS[index] ?? 1_200;
-}
-
-const CREATURE_PROGRESS_PER_MS = 1 / CREATURE_CROSSING_MS;
-const PLAYER_PROGRESS_PER_MS = 1 / 6_000;
+export const CROWD_SPEED = 1;
+const RIVAL_SHOT_CAP = [2, 3] as const;
 
 type Subscriber = (state: DontWaveState) => void;
 
 export interface DontWaveSessionOptions {
-  readonly creatures?: readonly CreatureDefinition[];
+  readonly definitions?: readonly ContestantDefinition[];
   readonly bank?: TurnBank;
 }
 
 export class DontWaveSession {
   private seed: number;
-  private definitions: readonly CreatureDefinition[];
+  private definitions: readonly ContestantDefinition[];
   private bank: TurnBank;
+  private readonly suppliedDefinitions: readonly ContestantDefinition[] | null;
+  private readonly suppliedBank: TurnBank | null;
   private state: DontWaveState;
   private readonly subscribers = new Set<Subscriber>();
-  private readonly consumedRecordIds = new Set<string>();
+  private nextEventId = 1;
 
   constructor(seed: number, options: DontWaveSessionOptions = {}) {
     this.seed = normalizeSeed(seed);
-    this.definitions = options.creatures ?? createCreatureDefinitions(this.seed);
-    this.bank = options.bank ?? new ClassicalDemoTurnBank(this.seed, this.definitions);
-    validateBankIdentity(this.bank, this.seed, this.definitions);
-    this.state = createInitialState(this.seed, this.bank.bankId, this.definitions);
+    this.suppliedDefinitions = options.definitions ?? null;
+    this.definitions = this.suppliedDefinitions ?? createContestantDefinitions(this.seed, 1);
+    this.suppliedBank = options.bank ?? null;
+    this.bank = this.suppliedBank ?? new ClassicalDemoTurnBank(this.seed, this.definitions);
+    validateBank(this.bank, this.seed, this.definitions);
+    this.state = createInitialState(this.seed, this.definitions);
   }
 
   getState(): DontWaveState {
@@ -85,477 +89,470 @@ export class DontWaveSession {
 
   start(): boolean {
     if (this.state.phase !== "briefing") return false;
-    this.state = derive({
-      ...this.state,
-      phase: "ready",
-      phaseElapsedMs: 0,
-      statusMessage: "Round 1, turn 1 ready. Start GREEN when prepared.",
-    });
-    this.emit();
+    this.replace({ phase: "ready", phaseElapsedMs: 0, statusMessage: "Call GREEN LIGHT." });
     return true;
   }
 
   startGreen(): boolean {
-    if (this.state.phase !== "ready" || this.state.paused) return false;
-    this.state = derive({
-      ...this.state,
+    if (this.state.phase !== "ready") return false;
+    this.replace({
       phase: "green",
-      greenElapsedMs: 0,
       phaseElapsedMs: 0,
-      currentRecord: null,
-      revealedWavingIds: [],
-      revealedStillIds: [],
-      revealedSafeIds: [],
-      turnZaps: [],
+      greenElapsedMs: 0,
+      ammo: 0,
+      ammoAtRed: 0,
+      chargeProgress: 0,
       forcedRed: false,
-      turnPlayerHits: 0,
-      turnLeftOperatorHits: 0,
-      turnRightOperatorHits: 0,
+      currentRecord: null,
       revealedWavers: 0,
-      wavingRemaining: 0,
-      turnSafeAtStart: this.state.counts.safe,
-      creatures: setActivePose(this.state.creatures, "moving"),
-      statusMessage: this.state.history.length === 0
-        ? "GREEN. Watch the gate, then choose when to call RED."
-        : "GREEN. Waiting lets more people escape.",
+      revealedStills: 0,
+      rivalShotsUsedLeft: 0,
+      rivalShotsUsedRight: 0,
+      turnPlayerCorrect: 0,
+      turnPlayerWrong: 0,
+      turnLeftHits: 0,
+      turnRightHits: 0,
+      turnStartCrossed: this.state.counts.crossed,
+      contestants: setActivePose(this.state.contestants, "walking"),
+      statusMessage: "GREEN LIGHT",
     });
-    this.emit();
     return true;
   }
 
   triggerRed(): boolean {
-    if (this.state.phase !== "green" || this.state.paused || this.state.greenElapsedMs < MIN_RED_TRIGGER_MS) return false;
+    if (this.state.phase !== "green" || !this.state.canCallRed) return false;
     this.resolveRed(false);
     return true;
   }
 
-  zapCreature(creatureId: string): ZapCreatureResult {
-    if (this.state.paused) return { accepted: false, reason: "paused" };
-    if (this.state.phase !== "hunt") return { accepted: false, reason: "not-hunting" };
-    const creature = this.state.creatures.find((candidate) => candidate.id === creatureId);
-    if (!creature) return { accepted: false, reason: "unknown-creature" };
-    if (creature.status === "removed" || creature.zappedBy) {
-      this.recordPlayerMiss(`Too late: ${creature.name} was already claimed.`);
-      return { accepted: false, reason: "already-zapped" };
-    }
-    if (creature.status !== "active" || creature.pose !== "waving") {
-      this.recordPlayerMiss(`${creature.name} was still. Miss recorded.`);
-      return { accepted: false, reason: "not-waving" };
-    }
+  fire(targetId: string | null): FireResult {
+    if (this.state.phase !== "hunt") return { fired: false, reason: "not-hunting" };
+    if (this.state.ammo <= 0) return { fired: false, reason: "no-ammo" };
 
-    const event = this.claimCreature(creature.id, "player");
-    if (!event) throw new Error(`Eligible waving creature ${creature.id} could not be claimed.`);
-    this.state = derive({ ...this.state, statusMessage: `${creature.name} zapped. +${CORRECT_HIT_SCORE}.` });
-    this.emit();
-    return { accepted: true, event };
+    const target = targetId === null
+      ? null
+      : this.state.contestants.find((contestant) => contestant.id === targetId) ?? null;
+    let outcome: ShotOutcome = "empty";
+    let scoreDelta = 0;
+    let contestants = this.state.contestants;
+    if (target?.status === "active" && (target.pose === "waving" || target.pose === "still")) {
+      outcome = target.pose === "waving" ? "correct" : "wrong";
+      scoreDelta = outcome === "correct" ? CORRECT_SCORE : WRONG_SCORE;
+      contestants = removeContestant(this.state.contestants, target.id, "player", outcome);
+    }
+    const event = this.createEvent("player", outcome === "empty" ? null : target?.id ?? null, outcome, scoreDelta);
+    this.replace({
+      contestants,
+      ammo: this.state.ammo - 1,
+      playerScore: this.state.playerScore + scoreDelta,
+      playerCorrect: this.state.playerCorrect + (outcome === "correct" ? 1 : 0),
+      playerWrong: this.state.playerWrong + (outcome === "wrong" ? 1 : 0),
+      emptyShots: this.state.emptyShots + (outcome === "empty" ? 1 : 0),
+      turnPlayerCorrect: this.state.turnPlayerCorrect + (outcome === "correct" ? 1 : 0),
+      turnPlayerWrong: this.state.turnPlayerWrong + (outcome === "wrong" ? 1 : 0),
+      events: [...this.state.events, event],
+      statusMessage: outcome === "correct" ? "+100" : outcome === "wrong" ? "−100" : "EMPTY",
+    });
+    return { fired: true, event };
   }
 
-  registerMiss(): boolean {
-    if (this.state.phase !== "hunt" || this.state.paused) return false;
-    this.recordPlayerMiss("Empty shot. Miss recorded.");
+  continueRound(): boolean {
+    if (this.state.phase !== "round-break") return false;
+    const round = 2;
+    this.definitions = this.suppliedDefinitions ?? createContestantDefinitions(this.seed, round);
+    validateDefinitions(this.definitions, this.bank.contestantIds);
+    this.replace({
+      phase: "ready",
+      round,
+      turn: 1,
+      crowdRevision: this.state.crowdRevision + 1,
+      phaseElapsedMs: 0,
+      greenElapsedMs: 0,
+      ammo: 0,
+      ammoAtRed: 0,
+      chargeProgress: 0,
+      currentRecord: null,
+      forcedRed: false,
+      revealedWavers: 0,
+      revealedStills: 0,
+      rivalShotsUsedLeft: 0,
+      rivalShotsUsedRight: 0,
+      turnPlayerCorrect: 0,
+      turnPlayerWrong: 0,
+      turnLeftHits: 0,
+      turnRightHits: 0,
+      contestants: instantiate(this.definitions),
+      turnStartCrossed: 0,
+      statusMessage: "Round two. Call GREEN LIGHT.",
+    });
     return true;
   }
 
-  continueFromReport(): boolean {
-    if (this.state.phase !== "report" || this.state.paused) return false;
-    const runComplete = this.state.round === TOTAL_ROUNDS && this.state.turn === TURNS_PER_ROUND;
-    if (runComplete) {
-      this.state = derive({
-        ...this.state,
-        phase: "descent",
-        phaseElapsedMs: 0,
-        playerMoving: false,
-        statusMessage: "Your station is descending to the field.",
-      });
-      this.emit();
-      return true;
-    }
-    const nextRound = this.state.turn === TURNS_PER_ROUND ? this.state.round + 1 : this.state.round;
-    const nextTurn = this.state.turn === TURNS_PER_ROUND ? 1 : this.state.turn + 1;
-    this.state = derive({
-      ...this.state,
-      phase: "ready",
-      round: nextRound,
-      turn: nextTurn,
-      greenElapsedMs: 0,
-      phaseElapsedMs: 0,
-      currentRecord: null,
-      revealedWavingIds: [],
-      revealedStillIds: [],
-      revealedSafeIds: [],
-      turnZaps: [],
-      forcedRed: false,
-      turnPlayerHits: 0,
-      turnLeftOperatorHits: 0,
-      turnRightOperatorHits: 0,
-      revealedWavers: 0,
-      wavingRemaining: 0,
-      turnSafeAtStart: this.state.counts.safe,
-      creatures: setActivePose(this.state.creatures, "idle"),
-      statusMessage: `Round ${nextRound}, turn ${nextTurn}. Release the field when ready.`,
-    });
-    this.emit();
+  leaveTower(): boolean {
+    if (this.state.phase !== "final-standings") return false;
+    this.replace({ phase: "descent", phaseElapsedMs: 0, statusMessage: "Descending." });
     return true;
   }
 
   beginCrossing(): boolean {
-    if (this.state.phase !== "crossing-ready" || this.state.paused) return false;
-    this.state = derive({
-      ...this.state,
+    if (this.state.phase !== "crossing-ready") return false;
+    this.replace({
       phase: "crossing-green",
       phaseElapsedMs: 0,
-      playerProgress: 0,
       playerMoving: false,
-      playerStoppedAtRed: false,
-      statusMessage: "GREEN. Hold movement to cross.",
+      playerProgress: 0,
+      statusMessage: "GREEN LIGHT",
     });
-    this.emit();
     return true;
   }
 
   setPlayerMoving(moving: boolean): boolean {
-    if (this.state.phase !== "crossing-green" || this.state.paused) return false;
+    if (this.state.phase !== "crossing-green") return false;
     if (this.state.playerMoving === moving) return true;
-    this.state = derive({ ...this.state, playerMoving: moving });
-    this.emit();
+    this.replace({ playerMoving: moving });
     return true;
-  }
-
-  pause(): boolean {
-    if (!isPausable(this.state.phase) || this.state.paused) return false;
-    this.state = derive({ ...this.state, paused: true, playerMoving: false, statusMessage: "Game paused." });
-    this.emit();
-    return true;
-  }
-
-  resume(): boolean {
-    if (!this.state.paused) return false;
-    this.state = derive({ ...this.state, paused: false, statusMessage: "Game resumed." });
-    this.emit();
-    return true;
-  }
-
-  togglePause(): void {
-    if (this.state.paused) this.resume();
-    else this.pause();
   }
 
   restart(seed = this.seed): void {
-    const normalizedSeed = normalizeSeed(seed);
-    if (normalizedSeed !== this.seed) {
-      this.seed = normalizedSeed;
-      this.definitions = createCreatureDefinitions(this.seed);
+    this.seed = normalizeSeed(seed);
+    this.definitions = this.suppliedDefinitions ?? createContestantDefinitions(this.seed, 1);
+    if (this.suppliedBank && this.suppliedBank.seed === this.seed) {
+      this.bank = this.suppliedBank;
+      this.bank.resetConsumption();
+    } else {
       this.bank = new ClassicalDemoTurnBank(this.seed, this.definitions);
     }
-    this.bank.resetConsumption();
-    this.consumedRecordIds.clear();
-    this.state = createInitialState(this.seed, this.bank.bankId, this.definitions);
+    validateBank(this.bank, this.seed, this.definitions);
+    this.nextEventId = 1;
+    this.state = createInitialState(this.seed, this.definitions);
     this.emit();
   }
 
   tick(deltaMs: number): void {
-    if (!Number.isFinite(deltaMs) || deltaMs <= 0 || this.state.paused) return;
-    const delta = Math.min(deltaMs, 10_000);
-    switch (this.state.phase) {
-      case "green":
-        this.tickGreen(delta);
-        break;
-      case "reveal":
-        this.tickReveal(delta);
-        break;
-      case "hunt":
-        this.tickHunt(delta);
-        break;
-      case "descent":
-        this.tickDescent(delta);
-        break;
-      case "crossing-green":
-        this.tickCrossingGreen(delta);
-        break;
-      case "crossing-red":
-        this.tickCrossingRed(delta);
-        break;
-      case "death":
-        this.tickDeath(delta);
-        break;
-      default:
-        break;
+    if (!Number.isFinite(deltaMs) || deltaMs <= 0) return;
+    let remainingMs = Math.min(10_000, deltaMs);
+    let transitions = 0;
+    while (remainingMs > 0 && transitions < 64) {
+      const boundaryMs = this.millisecondsToBoundary();
+      if (!Number.isFinite(boundaryMs)) return;
+      const stepMs = Math.min(remainingMs, Math.max(0, boundaryMs));
+      const before = this.progressSignature();
+      this.tickPhase(stepMs);
+      remainingMs -= stepMs;
+      transitions += 1;
+      if (stepMs === 0 && this.progressSignature() === before) return;
     }
   }
 
+  private tickPhase(deltaMs: number): void {
+    switch (this.state.phase) {
+      case "green": this.tickGreen(deltaMs); break;
+      case "reveal": this.tickReveal(deltaMs); break;
+      case "hunt": this.tickHunt(deltaMs); break;
+      case "rivals": this.tickRivals(deltaMs); break;
+      case "interturn": this.tickInterturn(deltaMs); break;
+      case "descent": this.tickDescent(deltaMs); break;
+      case "crossing-green": this.tickCrossingGreen(deltaMs); break;
+      case "crossing-red": this.tickCrossingRed(deltaMs); break;
+      case "death": this.tickDeath(deltaMs); break;
+      default: break;
+    }
+  }
+
+  private millisecondsToBoundary(): number {
+    switch (this.state.phase) {
+      case "green": return Math.max(0, MAX_GREEN_MS - this.state.greenElapsedMs);
+      case "reveal": return Math.max(0, REVEAL_MS - this.state.phaseElapsedMs);
+      case "hunt": return Math.max(0, HUNT_MS - this.state.phaseElapsedMs);
+      case "rivals": {
+        if (this.state.wavingRemaining === 0) {
+          return Math.max(0, rivalSettleDeadline(this.state) - this.state.phaseElapsedMs);
+        }
+        const cap = rivalShotCap(this.state.round);
+        const nextShotIndex = Math.min(this.state.rivalShotsUsedLeft, this.state.rivalShotsUsedRight);
+        const deadline = nextShotIndex < cap
+          ? RIVAL_FIRST_SHOT_MS + nextShotIndex * RIVAL_SHOT_INTERVAL_MS
+          : rivalSettleDeadline(this.state);
+        return Math.max(0, deadline - this.state.phaseElapsedMs);
+      }
+      case "interturn": return Math.max(0, INTERTURN_MS - this.state.phaseElapsedMs);
+      case "descent": return Math.max(0, DESCENT_MS - this.state.phaseElapsedMs);
+      case "crossing-green": return Math.max(0, CROSSING_GREEN_MS - this.state.phaseElapsedMs);
+      case "crossing-red": return Math.max(0, CROSSING_RED_MS - this.state.phaseElapsedMs);
+      case "death": return Math.max(0, DEATH_MS - this.state.phaseElapsedMs);
+      default: return Number.POSITIVE_INFINITY;
+    }
+  }
+
+  private progressSignature(): string {
+    return [
+      this.state.phase,
+      this.state.phaseElapsedMs,
+      this.state.greenElapsedMs,
+      this.state.rivalShotsUsedLeft,
+      this.state.rivalShotsUsedRight,
+      this.state.wavingRemaining,
+    ].join("|");
+  }
+
   private tickGreen(deltaMs: number): void {
-    const remaining = Math.max(0, MAX_GREEN_MS - this.state.greenElapsedMs);
-    const movementDelta = Math.min(deltaMs, remaining);
-    const creatures = this.state.creatures.map((creature): CreatureRuntimeState => {
-      if (creature.status !== "active") return creature;
-      const progress = Math.min(1, creature.progress + movementDelta * CREATURE_PROGRESS_PER_MS);
-      if (progress >= 1) return { ...creature, progress: 1, status: "safe", pose: "safe" };
-      return { ...creature, progress, pose: "moving" };
+    const movementMs = Math.min(deltaMs, MAX_GREEN_MS - this.state.greenElapsedMs);
+    const speed = CROWD_SPEED;
+    const contestants = this.state.contestants.map((contestant): ContestantState => {
+      if (contestant.status !== "active") return contestant;
+      const z = contestant.z + speed * movementMs / 1_000;
+      if (z >= FINISH_Z) return { ...contestant, z: FINISH_Z, status: "crossed", pose: "idle" };
+      return { ...contestant, z, pose: "walking" };
     });
-    const greenElapsedMs = this.state.greenElapsedMs + movementDelta;
-    this.state = derive({ ...this.state, greenElapsedMs, phaseElapsedMs: greenElapsedMs, creatures });
+    const greenElapsedMs = this.state.greenElapsedMs + movementMs;
+    const ammo = Math.min(MAX_AMMO, Math.floor(greenElapsedMs / CHARGE_STEP_MS));
+    this.state = derive({
+      ...this.state,
+      contestants,
+      phaseElapsedMs: greenElapsedMs,
+      greenElapsedMs,
+      ammo,
+      chargeProgress: Math.min(1, greenElapsedMs / (CHARGE_STEP_MS * MAX_AMMO)),
+    });
     if (greenElapsedMs >= MAX_GREEN_MS) this.resolveRed(true);
     else this.emit();
   }
 
   private resolveRed(forcedRed: boolean): void {
     const address = { round: this.state.round, turn: this.state.turn } as const;
-    const returnedRecord = this.bank.consume(address);
-    validateTurnRecord(returnedRecord, this.definitions.map((definition) => definition.id), this.bank.bankId);
-    if (turnAddressKey(returnedRecord.address) !== turnAddressKey(address)) {
-      throw new Error(`Turn bank returned ${turnAddressKey(returnedRecord.address)} for requested address ${turnAddressKey(address)}.`);
-    }
-    if (this.consumedRecordIds.has(returnedRecord.id)) {
-      throw new Error(`Turn bank reused record ID ${returnedRecord.id} within one run.`);
-    }
-    this.consumedRecordIds.add(returnedRecord.id);
-    const record = snapshotRecord(returnedRecord);
-
-    const wavingIds: string[] = [];
-    const stillIds: string[] = [];
-    const safeIds: string[] = [];
-    const creatures = this.state.creatures.map((creature): CreatureRuntimeState => {
-      if (creature.status === "safe") {
-        safeIds.push(creature.id);
-        return { ...creature, pose: "safe" };
+    const record = snapshotRecord(this.bank.consume(address));
+    validateTurnRecord(record, this.bank.contestantIds, this.bank.bankId);
+    if (turnAddressKey(record.address) !== turnAddressKey(address)) throw new Error("Turn bank returned the wrong address.");
+    const wavingIds = selectWavingIds(record, this.state.contestants);
+    let revealedWavers = 0;
+    let revealedStills = 0;
+    const contestants = this.state.contestants.map((contestant): ContestantState => {
+      if (contestant.status !== "active") return contestant;
+      if (wavingIds.has(contestant.id)) {
+        revealedWavers += 1;
+        return { ...contestant, pose: "waving" };
       }
-      if (creature.status === "removed") return creature;
-      const outcome = record.outcomes[creature.id];
-      if (!outcome) throw new Error(`Prepared record ${record.id} has no outcome for ${creature.id}.`);
-      if (outcome === "waving") {
-        wavingIds.push(creature.id);
-        return { ...creature, pose: "waving" };
-      }
-      stillIds.push(creature.id);
-      return { ...creature, pose: "still" };
+      revealedStills += 1;
+      return { ...contestant, pose: "still" };
     });
-
-    this.state = derive({
-      ...this.state,
+    this.replace({
       phase: "reveal",
       phaseElapsedMs: 0,
       currentRecord: record,
-      revealedWavingIds: wavingIds,
-      revealedStillIds: stillIds,
-      revealedSafeIds: safeIds,
-      turnZaps: [],
       forcedRed,
-      turnPlayerHits: 0,
-      turnLeftOperatorHits: 0,
-      turnRightOperatorHits: 0,
-      revealedWavers: wavingIds.length,
-      wavingRemaining: wavingIds.length,
-      creatures,
-      statusMessage: forcedRed ? "RED triggered automatically." : "RED. Outcomes revealed.",
+      ammoAtRed: this.state.ammo,
+      contestants,
+      revealedWavers,
+      revealedStills,
+      statusMessage: "RED LIGHT",
     });
-    this.emit();
   }
 
   private tickReveal(deltaMs: number): void {
     const phaseElapsedMs = Math.min(REVEAL_MS, this.state.phaseElapsedMs + deltaMs);
     if (phaseElapsedMs < REVEAL_MS) {
-      this.state = derive({ ...this.state, phaseElapsedMs });
-      this.emit();
+      this.replace({ phaseElapsedMs });
       return;
     }
-    this.state = derive({
-      ...this.state,
-      phase: "hunt",
-      phaseElapsedMs: 0,
-      statusMessage: this.state.history.length === 0
-        ? "CLICK THE WAVERS. The side towers will join shortly."
-        : "Hunt open. Claim the wavers before the towers do.",
-    });
-    this.emit();
+    this.replace({ phase: "hunt", phaseElapsedMs: 0, statusMessage: "FIRE" });
   }
 
   private tickHunt(deltaMs: number): void {
-    const nextElapsed = Math.min(HUNT_MS, this.state.phaseElapsedMs + deltaMs);
-    this.state = derive({ ...this.state, phaseElapsedMs: nextElapsed });
-
-    while (this.state.wavingRemaining > 0) {
-      const sideHitsThisTurn = this.state.turnLeftOperatorHits + this.state.turnRightOperatorHits;
-      const nextZapAt = this.state.sideOperatorStartsAtMs + sideHitsThisTurn * SIDE_OPERATOR_INTERVAL_MS;
-      if (nextZapAt > nextElapsed || nextZapAt > HUNT_MS) break;
-      const operator: SideOperatorId = sideHitsThisTurn % 2 === 0 ? "left" : "right";
-      const target = this.nextSideOperatorTarget(operator);
-      if (!target) break;
-      this.claimCreature(target.id, operator, nextZapAt);
-    }
-
-    if (this.state.wavingRemaining === 0) {
-      this.finishHunt();
+    const phaseElapsedMs = Math.min(HUNT_MS, this.state.phaseElapsedMs + deltaMs);
+    if (phaseElapsedMs < HUNT_MS) {
+      this.replace({ phaseElapsedMs });
       return;
     }
-
-    if (nextElapsed < HUNT_MS) {
-      this.emit();
-      return;
-    }
-
-    this.finishHunt();
+    this.replace({ phase: "rivals", phaseElapsedMs: 0, statusMessage: "TOWERS ACTIVE" });
   }
 
-  private nextSideOperatorTarget(operator: SideOperatorId): CreatureRuntimeState | null {
+  private tickRivals(deltaMs: number): void {
+    const cap = rivalShotCap(this.state.round);
+    const phaseElapsedMs = this.state.phaseElapsedMs + deltaMs;
+    let leftUsed = this.state.rivalShotsUsedLeft;
+    let rightUsed = this.state.rivalShotsUsedRight;
+    for (let shotIndex = 0; shotIndex < cap; shotIndex += 1) {
+      const shotAt = RIVAL_FIRST_SHOT_MS + shotIndex * RIVAL_SHOT_INTERVAL_MS;
+      if (shotAt > phaseElapsedMs || this.countWavers() === 0) break;
+      const preferred = preferredRival(this.state.round, this.state.turn, shotIndex);
+      const order: readonly RivalId[] = preferred === "left" ? ["left", "right"] : ["right", "left"];
+      for (const operator of order) {
+        if (this.countWavers() === 0) break;
+        const used = operator === "left" ? leftUsed : rightUsed;
+        if (used > shotIndex) continue;
+        if (this.fireRival(operator, shotIndex)) {
+          if (operator === "left") leftUsed += 1;
+          else rightUsed += 1;
+        }
+      }
+    }
+
+    this.state = derive({
+      ...this.state,
+      phaseElapsedMs,
+      rivalShotsUsedLeft: leftUsed,
+      rivalShotsUsedRight: rightUsed,
+    });
+    if (phaseElapsedMs >= rivalSettleDeadline(this.state)) this.finishTurn();
+    else this.emit();
+  }
+
+  private fireRival(operator: RivalId, shotIndex: number): boolean {
+    const target = this.nextRivalTarget(operator, shotIndex);
+    if (!target) return false;
+    const shotAt = RIVAL_FIRST_SHOT_MS + shotIndex * RIVAL_SHOT_INTERVAL_MS;
+    const event = this.createEvent(operator, target.id, "correct", CORRECT_SCORE, shotAt);
+    this.state = derive({
+      ...this.state,
+      contestants: removeContestant(this.state.contestants, target.id, operator, "correct"),
+      leftScore: this.state.leftScore + (operator === "left" ? CORRECT_SCORE : 0),
+      rightScore: this.state.rightScore + (operator === "right" ? CORRECT_SCORE : 0),
+      turnLeftHits: this.state.turnLeftHits + (operator === "left" ? 1 : 0),
+      turnRightHits: this.state.turnRightHits + (operator === "right" ? 1 : 0),
+      events: [...this.state.events, event],
+    });
+    return true;
+  }
+
+  private nextRivalTarget(operator: RivalId, shotIndex: number): ContestantState | null {
     const recordId = this.state.currentRecord?.id;
-    if (!recordId) throw new Error("Hunt has no current prepared record.");
-    const candidates = this.state.creatures.filter((creature) => (
-      creature.status === "active" && creature.pose === "waving" && !creature.zappedBy
+    if (!recordId) throw new Error("Rival volley has no prepared record.");
+    const candidates = this.state.contestants.filter((contestant) => (
+      contestant.status === "active" && contestant.pose === "waving"
     ));
     candidates.sort((left, right) => (
-      mixSeed(this.seed, recordId, operator, left.id) - mixSeed(this.seed, recordId, operator, right.id)
+      mixSeed(this.seed, recordId, operator, shotIndex, left.id)
+      - mixSeed(this.seed, recordId, operator, shotIndex, right.id)
     ));
     return candidates[0] ?? null;
   }
 
-  private claimCreature(
-    creatureId: string,
-    operator: OperatorId,
-    huntElapsedMs = this.state.phaseElapsedMs,
-  ): ZapEvent | null {
-    const creature = this.state.creatures.find((candidate) => candidate.id === creatureId);
-    if (!creature || creature.status !== "active" || creature.pose !== "waving" || creature.zappedBy) return null;
-    const scoreDelta = operator === "player" ? CORRECT_HIT_SCORE : 0;
-    const event: ZapEvent = Object.freeze({ operator, creatureId, huntElapsedMs, scoreDelta });
-    const creatures = this.state.creatures.map((candidate): CreatureRuntimeState => (
-      candidate.id === creatureId
-        ? { ...candidate, status: "removed", pose: "zapped", zappedBy: operator }
-        : candidate
-    ));
-    this.state = derive({
-      ...this.state,
-      creatures,
-      turnZaps: [...this.state.turnZaps, event],
-      playerScore: this.state.playerScore + scoreDelta,
-      playerHits: this.state.playerHits + (operator === "player" ? 1 : 0),
-      leftOperatorHits: this.state.leftOperatorHits + (operator === "left" ? 1 : 0),
-      rightOperatorHits: this.state.rightOperatorHits + (operator === "right" ? 1 : 0),
-      turnPlayerHits: this.state.turnPlayerHits + (operator === "player" ? 1 : 0),
-      turnLeftOperatorHits: this.state.turnLeftOperatorHits + (operator === "left" ? 1 : 0),
-      turnRightOperatorHits: this.state.turnRightOperatorHits + (operator === "right" ? 1 : 0),
-      wavingRemaining: this.state.wavingRemaining - 1,
-    });
-    return event;
-  }
-
-  private recordPlayerMiss(statusMessage: string): void {
-    this.state = derive({
-      ...this.state,
-      playerMisses: this.state.playerMisses + 1,
-      statusMessage,
-    });
-    this.emit();
-  }
-
-  private finishHunt(): void {
+  private finishTurn(): void {
     const record = this.state.currentRecord;
-    if (!record) throw new Error("Cannot finish a hunt without its prepared record.");
-    const unresolvedWavingIds = this.state.creatures
-      .filter((creature) => creature.status === "active" && creature.pose === "waving" && !creature.zappedBy)
-      .map((creature) => creature.id);
-    if (unresolvedWavingIds.length !== this.state.wavingRemaining) {
-      throw new Error("Waving count disagrees with unresolved prepared outcomes.");
-    }
-    const escapedThisTurn = this.state.counts.safe - this.state.turnSafeAtStart;
+    if (!record) throw new Error("Cannot finish a turn without a prepared record.");
     const summary: TurnSummary = Object.freeze({
+      address: Object.freeze({ round: this.state.round, turn: this.state.turn }),
       recordId: record.id,
-      bankId: record.bankId,
-      address: record.address,
-      provenance: record.provenance,
-      greenElapsedMs: this.state.greenElapsedMs,
       forcedRed: this.state.forcedRed,
-      wavingIds: Object.freeze([...this.state.revealedWavingIds]),
-      stillIds: Object.freeze([...this.state.revealedStillIds]),
-      safeIds: Object.freeze([...this.state.revealedSafeIds]),
-      escapedThisTurn,
-      unresolvedWavingIds: Object.freeze(unresolvedWavingIds),
-      zaps: Object.freeze([...this.state.turnZaps]),
+      greenElapsedMs: this.state.greenElapsedMs,
+      ammoAtRed: this.state.ammoAtRed,
+      revealedWavers: this.state.revealedWavers,
+      playerCorrect: this.state.turnPlayerCorrect,
+      playerWrong: this.state.turnPlayerWrong,
+      leftHits: this.state.turnLeftHits,
+      rightHits: this.state.turnRightHits,
+      unresolvedWavers: this.state.wavingRemaining,
+      crossedThisTurn: Math.max(0, this.state.counts.crossed - this.state.turnStartCrossed),
     });
-    const history = [...this.state.history, summary];
-    this.state = derive({
-      ...this.state,
-      phase: "report",
+    this.replace({
+      phase: "interturn",
       phaseElapsedMs: 0,
-      history,
-      creatures: setActivePose(this.state.creatures, "idle"),
-      playerMoving: false,
-      statusMessage: `Turn complete. ${escapedThisTurn} escaped; ${unresolvedWavingIds.length} wavers remain in the field.`,
+      contestants: setActivePose(this.state.contestants, "idle"),
+      history: [...this.state.history, summary],
+      statusMessage: "TURN COMPLETE",
     });
-    this.emit();
+  }
+
+  private tickInterturn(deltaMs: number): void {
+    const phaseElapsedMs = Math.min(INTERTURN_MS, this.state.phaseElapsedMs + deltaMs);
+    if (phaseElapsedMs < INTERTURN_MS) {
+      this.replace({ phaseElapsedMs });
+      return;
+    }
+    if (this.state.turn < TURNS_PER_ROUND) {
+      this.replace({
+        phase: "ready",
+        turn: this.state.turn + 1,
+        phaseElapsedMs: 0,
+        greenElapsedMs: 0,
+        ammo: 0,
+        ammoAtRed: 0,
+        chargeProgress: 0,
+        currentRecord: null,
+        revealedWavers: 0,
+        revealedStills: 0,
+        rivalShotsUsedLeft: 0,
+        rivalShotsUsedRight: 0,
+        statusMessage: "Call GREEN LIGHT.",
+      });
+      return;
+    }
+    this.replace({
+      phase: this.state.round === TOTAL_ROUNDS ? "final-standings" : "round-break",
+      phaseElapsedMs: 0,
+      statusMessage: this.state.round === TOTAL_ROUNDS ? "FINAL STANDINGS" : "ROUND COMPLETE",
+    });
   }
 
   private tickDescent(deltaMs: number): void {
     const phaseElapsedMs = Math.min(DESCENT_MS, this.state.phaseElapsedMs + deltaMs);
     if (phaseElapsedMs < DESCENT_MS) {
-      this.state = derive({ ...this.state, phaseElapsedMs });
-      this.emit();
+      this.replace({ phaseElapsedMs });
       return;
     }
-    this.state = derive({
-      ...this.state,
-      phase: "crossing-ready",
-      phaseElapsedMs: 0,
-      statusMessage: "You are in the field. The crossing is compulsory.",
-    });
-    this.emit();
+    this.replace({ phase: "crossing-ready", phaseElapsedMs: 0, statusMessage: "FIELD LEVEL" });
   }
 
   private tickCrossingGreen(deltaMs: number): void {
-    const remaining = Math.max(0, CROSSING_GREEN_MS - this.state.phaseElapsedMs);
-    const crossingDelta = Math.min(deltaMs, remaining);
+    const movementMs = Math.min(deltaMs, CROSSING_GREEN_MS - this.state.phaseElapsedMs);
     const playerProgress = this.state.playerMoving
-      ? Math.min(0.9, this.state.playerProgress + crossingDelta * PLAYER_PROGRESS_PER_MS)
+      ? Math.min(1, this.state.playerProgress + movementMs / CROSSING_GREEN_MS)
       : this.state.playerProgress;
-    const phaseElapsedMs = this.state.phaseElapsedMs + crossingDelta;
+    const phaseElapsedMs = this.state.phaseElapsedMs + movementMs;
     if (phaseElapsedMs < CROSSING_GREEN_MS) {
-      this.state = derive({ ...this.state, phaseElapsedMs, playerProgress });
-      this.emit();
+      this.replace({ phaseElapsedMs, playerProgress });
       return;
     }
-    this.state = derive({
-      ...this.state,
+    this.replace({
       phase: "crossing-red",
       phaseElapsedMs: 0,
-      playerProgress,
-      playerStoppedAtRed: !this.state.playerMoving,
       playerMoving: false,
-      statusMessage: this.state.playerMoving
-        ? "RED. You were moving. Your arm rises."
-        : "RED. You stopped. Your arm rises anyway.",
+      playerProgress,
+      statusMessage: "RED LIGHT",
     });
-    this.emit();
   }
 
   private tickCrossingRed(deltaMs: number): void {
     const phaseElapsedMs = Math.min(CROSSING_RED_MS, this.state.phaseElapsedMs + deltaMs);
     if (phaseElapsedMs < CROSSING_RED_MS) {
-      this.state = derive({ ...this.state, phaseElapsedMs });
-      this.emit();
+      this.replace({ phaseElapsedMs });
       return;
     }
-    this.state = derive({
-      ...this.state,
-      phase: "death",
-      phaseElapsedMs: 0,
-      statusMessage: "The side operators fire.",
-    });
-    this.emit();
+    this.replace({ phase: "death", phaseElapsedMs: 0, statusMessage: "" });
   }
 
   private tickDeath(deltaMs: number): void {
     const phaseElapsedMs = Math.min(DEATH_MS, this.state.phaseElapsedMs + deltaMs);
     if (phaseElapsedMs < DEATH_MS) {
-      this.state = derive({ ...this.state, phaseElapsedMs });
-      this.emit();
+      this.replace({ phaseElapsedMs });
       return;
     }
-    this.state = derive({
-      ...this.state,
-      phase: "complete",
-      phaseElapsedMs: 0,
-      playerMoving: false,
-      statusMessage: "Shift complete.",
+    this.replace({ phase: "complete", phaseElapsedMs: 0, playerMoving: false, statusMessage: "DON'T WAVE" });
+  }
+
+  private countWavers(): number {
+    return this.state.contestants.filter((contestant) => contestant.status === "active" && contestant.pose === "waving").length;
+  }
+
+  private createEvent(
+    operator: OperatorId,
+    targetId: string | null,
+    outcome: ShotOutcome,
+    scoreDelta: number,
+    phaseElapsedMs = this.state.phaseElapsedMs,
+  ): ShotEvent {
+    return Object.freeze({
+      id: this.nextEventId++,
+      operator,
+      targetId,
+      outcome,
+      phaseElapsedMs,
+      scoreDelta,
     });
+  }
+
+  private replace(patch: Partial<DontWaveState>): void {
+    this.state = derive({ ...this.state, ...patch });
     this.emit();
   }
 
@@ -564,135 +561,141 @@ export class DontWaveSession {
   }
 }
 
-function createInitialState(
-  seed: number,
-  bankId: string,
-  definitions: readonly CreatureDefinition[],
-): DontWaveState {
-  const creatures: readonly CreatureRuntimeState[] = definitions.map((definition, index) => ({
-    ...definition,
-    status: "active",
-    pose: "idle",
-    progress: creatureStartingProgress(definition.id, index),
-  }));
+function createInitialState(seed: number, definitions: readonly ContestantDefinition[]): DontWaveState {
   return derive({
     seed,
-    bankId,
     phase: "briefing",
-    paused: false,
     round: 1,
     totalRounds: TOTAL_ROUNDS,
     turn: 1,
     turnsPerRound: TURNS_PER_ROUND,
-    greenElapsedMs: 0,
+    crowdRevision: 1,
     phaseElapsedMs: 0,
-    huntRemainingMs: 0,
-    sideOperatorStartsAtMs: sideOperatorStartMs(1, 1),
-    canTriggerRed: false,
-    creatures,
-    currentRecord: null,
-    revealedWavingIds: [],
-    revealedStillIds: [],
-    revealedSafeIds: [],
-    turnZaps: [],
+    greenElapsedMs: 0,
+    canCallRed: false,
     forcedRed: false,
-    history: [],
-    counts: countPopulation(creatures),
-    playerScore: 0,
-    playerHits: 0,
-    playerMisses: 0,
-    operatorHits: 0,
-    leftOperatorHits: 0,
-    rightOperatorHits: 0,
-    turnPlayerHits: 0,
-    turnLeftOperatorHits: 0,
-    turnRightOperatorHits: 0,
+    ammo: 0,
+    ammoAtRed: 0,
+    maxAmmo: MAX_AMMO,
+    chargeProgress: 0,
+    huntRemainingMs: 0,
+    contestants: instantiate(definitions),
+    currentRecord: null,
+    turnStartCrossed: 0,
     revealedWavers: 0,
+    revealedStills: 0,
     wavingRemaining: 0,
-    turnSafeAtStart: 0,
-    turnEscaped: 0,
-    playerProgress: 0,
+    rivalShotsUsedLeft: 0,
+    rivalShotsUsedRight: 0,
+    turnPlayerCorrect: 0,
+    turnPlayerWrong: 0,
+    turnLeftHits: 0,
+    turnRightHits: 0,
+    playerScore: 0,
+    leftScore: 0,
+    rightScore: 0,
+    playerCorrect: 0,
+    playerWrong: 0,
+    emptyShots: 0,
+    events: [],
+    history: [],
+    counts: { total: definitions.length, active: definitions.length, evaporated: 0, crossed: 0 },
     playerMoving: false,
-    playerStoppedAtRed: false,
-    statusMessage: "Awaiting briefing acknowledgement.",
+    playerProgress: 0,
+    statusMessage: "",
   });
 }
 
 function derive(state: DontWaveState): DontWaveState {
+  const counts = countPopulation(state.contestants);
+  const wavingRemaining = state.contestants.filter((contestant) => (
+    contestant.status === "active" && contestant.pose === "waving"
+  )).length;
   const huntRemainingMs = state.phase === "reveal"
     ? HUNT_MS
     : state.phase === "hunt"
       ? Math.max(0, HUNT_MS - state.phaseElapsedMs)
       : 0;
-  const operatorHits = state.leftOperatorHits + state.rightOperatorHits;
-  const counts = countPopulation(state.creatures);
-  const canTriggerRed = state.phase === "green"
-    && !state.paused
-    && state.greenElapsedMs >= MIN_RED_TRIGGER_MS;
-  const next = {
-    ...state,
-    huntRemainingMs,
-    canTriggerRed,
-    operatorHits,
-    sideOperatorStartsAtMs: sideOperatorStartMs(state.round, state.turn),
-    turnEscaped: Math.max(0, counts.safe - state.turnSafeAtStart),
-    counts,
-  };
-  if (next.currentRecord) {
-    const accounted = next.turnPlayerHits
-      + next.turnLeftOperatorHits
-      + next.turnRightOperatorHits
-      + next.wavingRemaining;
-    if (accounted !== next.revealedWavers) {
-      throw new Error(`Reveal accounting failed: ${accounted} resolved or pending for ${next.revealedWavers} wavers.`);
+  const canCallRed = state.phase === "green" && state.ammo > 0;
+  if ((state.phase === "reveal" || state.phase === "hunt" || state.phase === "rivals") && state.currentRecord) {
+    const accounted = state.turnPlayerCorrect + state.turnLeftHits + state.turnRightHits + wavingRemaining;
+    if (accounted !== state.revealedWavers) {
+      throw new Error(`Waver accounting failed: ${accounted} of ${state.revealedWavers}.`);
     }
   }
-  return next;
+  return { ...state, counts, wavingRemaining, huntRemainingMs, canCallRed };
 }
 
-function countPopulation(creatures: readonly CreatureRuntimeState[]): PopulationCounts {
+function instantiate(definitions: readonly ContestantDefinition[]): readonly ContestantState[] {
+  return definitions.map((definition): ContestantState => ({
+    ...definition,
+    z: definition.startZ,
+    status: "active",
+    pose: "idle",
+  }));
+}
+
+function setActivePose(contestants: readonly ContestantState[], pose: "idle" | "walking"): readonly ContestantState[] {
+  return contestants.map((contestant): ContestantState => (
+    contestant.status === "active" ? { ...contestant, pose } : contestant
+  ));
+}
+
+function removeContestant(
+  contestants: readonly ContestantState[],
+  id: string,
+  operator: OperatorId,
+  reason: "correct" | "wrong",
+): readonly ContestantState[] {
+  return contestants.map((contestant): ContestantState => (
+    contestant.id === id
+      ? { ...contestant, status: "evaporated", pose: "idle", removedBy: operator, removalReason: reason }
+      : contestant
+  ));
+}
+
+function countPopulation(contestants: readonly ContestantState[]): PopulationCounts {
   let active = 0;
-  let safe = 0;
-  let removed = 0;
-  for (const creature of creatures) {
-    if (creature.status === "active") active += 1;
-    else if (creature.status === "safe") safe += 1;
-    else removed += 1;
+  let evaporated = 0;
+  let crossed = 0;
+  for (const contestant of contestants) {
+    if (contestant.status === "active") active += 1;
+    else if (contestant.status === "evaporated") evaporated += 1;
+    else crossed += 1;
   }
-  return { total: creatures.length, active, safe, removed, survivors: active + safe };
+  return { total: contestants.length, active, evaporated, crossed };
 }
 
-function setActivePose(
-  creatures: readonly CreatureRuntimeState[],
-  pose: "idle" | "moving",
-): readonly CreatureRuntimeState[] {
-  return creatures.map((creature): CreatureRuntimeState => {
-    if (creature.status === "active") return { ...creature, pose };
-    if (creature.status === "safe") return { ...creature, pose: "safe" };
-    return creature;
-  });
+function rivalShotCap(round: number): number {
+  return RIVAL_SHOT_CAP[round - 1] ?? RIVAL_SHOT_CAP[0];
 }
 
-function isPausable(phase: DontWavePhase): boolean {
-  return phase !== "briefing" && phase !== "death" && phase !== "complete";
+function preferredRival(round: number, turn: number, shotIndex: number): RivalId {
+  const absoluteTurn = (round - 1) * TURNS_PER_ROUND + (turn - 1);
+  return (absoluteTurn + shotIndex) % 2 === 0 ? "left" : "right";
 }
 
-function validateBankIdentity(
-  bank: TurnBank,
-  seed: number,
-  definitions: readonly CreatureDefinition[],
-): void {
+function selectWavingIds(record: TurnRecord, contestants: readonly ContestantState[]): ReadonlySet<string> {
+  const active = contestants.filter((contestant) => contestant.status === "active");
+  const activeIds = new Set(active.map((contestant) => contestant.id));
+  const targetCount = Math.min(WAVERS_PER_TURN, Math.max(0, active.length - 2));
+  return new Set(record.priority.filter((id) => activeIds.has(id)).slice(0, targetCount));
+}
+
+function validateBank(bank: TurnBank, seed: number, definitions: readonly ContestantDefinition[]): void {
   if (bank.schemaVersion !== TURN_RECORD_SCHEMA_VERSION || bank.modelId !== TURN_RECORD_MODEL_ID) {
-    throw new Error(`Turn bank must use schema v3 and model ${TURN_RECORD_MODEL_ID}.`);
+    throw new Error(`Turn bank must use schema v5 and model ${TURN_RECORD_MODEL_ID}.`);
   }
-  if (bank.seed !== seed) throw new Error(`Turn bank seed ${bank.seed} does not match run seed ${seed}.`);
-  const expected = definitions.map((definition) => definition.id).sort();
-  const actual = [...bank.creatureIds].sort();
-  if (expected.length !== actual.length || expected.some((id, index) => id !== actual[index])) {
-    throw new Error("Turn bank identity set does not match the run population.");
-  }
-  if (bank.recordCount() !== TOTAL_ROUNDS * TURNS_PER_ROUND) {
-    throw new Error(`Turn bank must contain exactly ${TOTAL_ROUNDS * TURNS_PER_ROUND} prepared records.`);
+  if (bank.seed !== seed) throw new Error("Turn bank seed does not match the session seed.");
+  validateDefinitions(definitions, bank.contestantIds);
+  if (bank.recordCount() !== TOTAL_ROUNDS * TURNS_PER_ROUND) throw new Error("Turn bank must contain eight prepared records.");
+}
+
+function validateDefinitions(definitions: readonly ContestantDefinition[], expectedIds: readonly string[]): void {
+  const actual = definitions.map((definition) => definition.id).sort();
+  const expected = [...expectedIds].sort();
+  if (actual.length !== expected.length || actual.some((id, index) => id !== expected[index])) {
+    throw new Error("Contestant identities do not match the prepared bank.");
   }
 }
 
@@ -702,7 +705,23 @@ function snapshotRecord(record: TurnRecord): TurnRecord {
     id: record.id,
     bankId: record.bankId,
     address: Object.freeze({ ...record.address }),
-    outcomes: Object.freeze({ ...record.outcomes }),
+    priority: Object.freeze([...record.priority]),
     provenance: Object.freeze({ ...record.provenance }),
   });
+}
+
+export function phaseAcceptsInput(phase: DontWavePhase): boolean {
+  return phase === "ready" || phase === "green" || phase === "hunt" || phase === "crossing-green";
+}
+
+function rivalSettleDeadline(state: DontWaveState): number {
+  const cap = rivalShotCap(state.round);
+  if (state.wavingRemaining > 0) {
+    return RIVAL_FIRST_SHOT_MS + Math.max(0, cap - 1) * RIVAL_SHOT_INTERVAL_MS + RIVAL_SETTLE_MS;
+  }
+  const firedVolleys = Math.max(state.rivalShotsUsedLeft, state.rivalShotsUsedRight);
+  const lastShotAt = firedVolleys > 0
+    ? RIVAL_FIRST_SHOT_MS + (firedVolleys - 1) * RIVAL_SHOT_INTERVAL_MS
+    : 0;
+  return lastShotAt + RIVAL_SETTLE_MS;
 }
